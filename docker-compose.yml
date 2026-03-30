@@ -1,0 +1,20 @@
+services:
+  llm-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8501:8501"
+    environment:
+      # Container -> host network mapping
+      TRANSCRIBE_URL: ${TRANSCRIBE_URL:-http://host.docker.internal:8077/api/v1/transcribe}
+      TRANSCRIBE_FILE_FIELD: ${TRANSCRIBE_FILE_FIELD:-file}
+
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      VLLM_URL: ${VLLM_URL:-http://host.docker.internal:8000}
+
+      LLM_TIMEOUT_SEC: ${LLM_TIMEOUT_SEC:-600}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+

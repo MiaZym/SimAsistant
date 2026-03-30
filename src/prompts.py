@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+
+def build_plan_prompt(*, analysis_mode: str, user_goal: str, sample_text: str) -> str:
+    """
+    Возвращает prompt, который просит модель:
+    1) составить план анализа
+    2) предложить параметры чанкирования
+
+    Вывод строго в markers:
+    ===PLAN=== ... ===PARAMS=== ...
+    """
+    base = [
+        "Ты — аналитик. Нужно составить план анализа большого текста по задаче пользователя.",
+        "Текст очень большой и будет разделён на чанки. На этапе плана НЕ анализируй весь документ целиком — используй только sample.",
+        "",
+        "Сначала верни план: что и в каком порядке нужно искать/сопоставлять, какие разделы итогового отчёта будут.",
+        "Затем предложи параметры чанкирования, чтобы модель успевала обрабатывать части.",
+        "",
+        "ВЫХОД СТРОГО В ФОРМАТЕ:",
+        "===PLAN===",
+        "[пошаговый план и структура результата]",
+        "===PARAMS===",
+        "chunk_size: <число>",
+        "chunk_overlap: <число>",
+        "split_strategy: <smart|separator|paragraphs|chars>",
+    ]
+
+    if analysis_mode == "spike":
+        base.extend(
+            [
+                "",
+                'Формат входа: набор транскриптов диалогов (каждый диалог обычно имеет dialogue_id и маркер "----Транскрибация----").',
+                "Задачи анализа: найти причины всплеска обращений и случаи referral (кто кого направил).",
+            ]
+        )
+    else:
+        base.extend(
+            [
+                "",
+                "Формат входа: обычный текст/документ(ы). Задача: найти паттерны, проблемы, факты и рекомендации.",
+            ]
+        )
+
+    base.extend(
+        [
+            "",
+            "USER_GOAL:",
+            user_goal or "(пусто)",
+            "",
+            "SAMPLE:",
+            sample_text or "(пусто)",
+            "",
+            "===END===",
+        ]
+    )
+
+    return "\n".join(base)
+
+
+def parse_plan_response(text: str) -> tuple[str, dict]:
+    raw = (text or "").strip()
+    import re
+
+    plan_match = re.search(r"===PLAN===([\s\S]*?)===PARAMS===", raw, flags=re.IGNORECASE)
+    params_match = re.search(r"===PARAMS===([\s\S]*?)===END===", raw, flags=re.IGNORECASE)
+    if not params_match:
+        params_match = re.search(r"===PARAMS===([\s\S]*)", raw, flags=re.IGNORECASE)
+
+    plan = plan_match.group(1).strip() if plan_match else ""
+    params_raw = params_match.group(1) if params_match else ""
+
+    chunk_size = _extract_int(r"chunk_size\s*:\s*(\d+)", params_raw)
+    chunk_overlap = _extract_int(r"chunk_overlap\s*:\s*(\d+)", params_raw)
+    split_strategy_raw = _extract_str(r"split_strategy\s*:\s*([a-z_]+)", params_raw)
+
+    allowed = {"smart", "separator", "paragraphs", "chars"}
+    split_strategy = split_strategy_raw if split_strategy_raw in allowed else None
+
+    return plan or raw, {
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "split_strategy": split_strategy,
+    }
+
+
+def _extract_int(pattern: str, text: str):
+    import re
+
+    m = re.search(pattern, text or "", flags=re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_str(pattern: str, text: str):
+    import re
+
+    m = re.search(pattern, text or "", flags=re.IGNORECASE)
+    if not m:
+        return None
+    return str(m.group(1)).strip()
+
+
+def build_chunk_prompt(
+    *,
+    analysis_mode: str,
+    plan: str,
+    user_goal: str,
+    summary: str,
+    chunk_text: str,
+    idx: int,
+    total: int,
+) -> str:
+    if analysis_mode == "spike":
+        return "\n".join(
+            [
+                "Ты — аналитик по пользовательским обращениям.",
+                "Перед тобой часть набора транскриптов диалогов.",
+                'Каждый диалог начинается с dialogue_id (строка), затем маркер "----Транскрибация----" и текст транскрипции.',
+                "",
+                "ОБЩИЙ ПЛАН АНАЛИЗА (следуй ему):",
+                plan or "(пусто)",
+                "",
+                "ТВОЯ ЦЕЛЬ ДЛЯ ЭТОГО ЧАНКА:",
+                "- Для КАЖДОГО диалога: выписать идентификатор dialogue_id и ЯВНЫЕ причины обращения клиента (пунктами).",
+                '- Выписать все фразы-рефералы (вариации "меня направили к вам", "меня перевели на вас", "мне сказали позвонить вам" и т.п.).',
+                "- Указывать кто направил (клиент/оператор/компания), если явно сказано.",
+                "",
+                "ФОРМАТ ВЫВОДА (строго):",
+                "===SUMMARY===",
+                "(группы причин + какие dialogue_id входят; до 20 пунктов)",
+                "===NOTES===",
+                "(подробные наблюдения по этому чанку: формулировки, цитаты/фразы, где именно встречаются)",
+                "",
+                f"Прогресс: чанк {idx} из {total}.",
+                "",
+                "ТЕКУЩЕЕ ОБЩЕЕ РЕЗЮМЕ (для накопления):",
+                summary or "(пусто)",
+                "",
+                "ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:",
+                user_goal or "(пусто)",
+                "",
+                "ТЕКСТ ЧАНКА:",
+                chunk_text,
+            ]
+        )
+
+    # general
+    return "\n".join(
+        [
+            "Ты — аналитик. Анализируешь большой документ по частям, накапливая общее резюме.",
+            "",
+            "ОБЩИЙ ПЛАН АНАЛИЗА (следуй ему):",
+            plan or "(пусто)",
+            "",
+            "КРИТИЧЕСКИ ВАЖНО — ЗАДАЧА ПОЛЬЗОВАТЕЛЯ (весь анализ должен быть направлен СТРОГО на эту цель):",
+            user_goal or "(пусто)",
+            "",
+            "Правила:",
+            "- анализируй строго по данным текущего чанка;",
+            "- извлекай ТОЛЬКО информацию, релевантную задаче пользователя;",
+            "- не выдумывай факты;",
+            "- если в чанке нет релевантной информации — так и укажи;",
+            "- пиши по-русски, структурно и конкретно.",
+            "",
+            "ФОРМАТ ВЫВОДА (строго):",
+            "===SUMMARY===",
+            "(обновлённое общее резюме: дополни/уточни предыдущее; до 25 пунктов, ТОЛЬКО по теме задачи)",
+            "===NOTES===",
+            "(наблюдения ТОЛЬКО по этому чанку, релевантные задаче: проблемы, паттерны, факты, цитаты/фразы)",
+            "",
+            f"Прогресс: чанк {idx} из {total}.",
+            "",
+            "ТЕКУЩЕЕ ОБЩЕЕ РЕЗЮМЕ (для накопления):",
+            summary or "(пусто)",
+            "",
+            "ТЕКСТ ЧАНКА:",
+            chunk_text,
+        ]
+    )
+
+
+def parse_chunk_response(text: str) -> dict:
+    raw = (text or "").strip()
+    import re
+
+    sum_re = re.compile(r"={2,}\s*(?:UPDATED_?)?SUMMARY\s*={2,}", flags=re.IGNORECASE)
+    notes_re = re.compile(r"={2,}\s*(?:CHUNK_?)?NOTES\s*={2,}", flags=re.IGNORECASE)
+
+    m_sum = sum_re.search(raw)
+    m_notes = notes_re.search(raw)
+
+    if m_sum and m_notes and m_notes.start() > m_sum.start():
+        summary = raw[m_sum.end() : m_notes.start()].strip()
+        notes = raw[m_notes.end() :].strip()
+        return {"parsed": True, "summary": summary, "notes": notes}
+
+    # fallback: any ===...=== markers
+    marker_re = re.compile(r"^={3,}.*={3,}$", flags=re.MULTILINE)
+    markers = list(marker_re.finditer(raw))
+    if len(markers) >= 2:
+        s_start = markers[0].end()
+        n_start = markers[1].start()
+        summary = raw[s_start:n_start].strip()
+        notes = raw[markers[1].end() :].strip()
+        if summary or notes:
+            return {"parsed": True, "summary": summary, "notes": notes}
+
+    return {"parsed": False, "summary": "", "notes": raw}
+
+
+def build_final_prompt(
+    *,
+    analysis_mode: str,
+    user_goal: str,
+    summary: str,
+    plan: str,
+) -> str:
+    if analysis_mode == "spike":
+        return "\n".join(
+            [
+                "Ты — старший аналитик по пользовательским обращениям.",
+                "У тебя есть накопленное резюме по всем чанкам.",
+                "",
+                "ОБЩИЙ ПЛАН АНАЛИЗА (для структуры отчёта):",
+                plan or "(пусто)",
+                "",
+                "Составь ИТОГОВЫЙ ПОДРОБНЫЙ ОТЧЁТ о всплеске обращений.",
+                "",
+                "Требования:",
+                "- Граница факт/гипотеза: явно разделяй где факт, а где гипотеза.",
+                "- Не придумывай данные, которых нет в резюме.",
+                "- Если данных для какого-то пункта отсутствует — так и укажи.",
+                "",
+                "Ориентировочная структура:",
+                "1. Краткое резюме (1–2 абзаца).",
+                "2. Основные группы причин всплеска (подробно, с примерами формулировок и списком dialogue_id).",
+                "3. Анализ referral/направлений (кто кого направлял и как это сказано).",
+                "4. Гипотезы происхождения всплеска (с опорой на группы диалогов).",
+                "5. Рекомендации: что проверить дополнительно и какие данные собрать.",
+                "",
+                "ЗАДАЧА ПОЛЬЗОВАТЕЛЯ:",
+                user_goal or "(пусто)",
+                "",
+                "НАКОПЛЕННОЕ РЕЗЮМЕ ПО ВСЕМ ЧАНКАМ:",
+                summary or "(пусто)",
+            ]
+        )
+
+    return "\n".join(
+        [
+            "Ты — старший аналитик.",
+            "Тебе предоставлено накопленное резюме анализа большого документа, обработанного по частям.",
+            "",
+            "ОБЩИЙ ПЛАН АНАЛИЗА (для структуры отчёта):",
+            plan or "(пусто)",
+            "",
+            "КРИТИЧЕСКИ ВАЖНО — ЗАДАЧА ПОЛЬЗОВАТЕЛЯ (отчёт должен отвечать СТРОГО на эту задачу):",
+            user_goal or "(пусто)",
+            "",
+            "Составь ИТОГОВЫЙ ОТЧЁТ в Markdown.",
+            "",
+            "Требования:",
+            "- Ответ полностью и строго соответствует задаче пользователя — не отклоняйся от неё.",
+            "- Будь конкретен: паттерны, проблемы, факты, примеры из резюме.",
+            "- Используй только данные из резюме, не выдумывай.",
+            "- Если данных для какого-то пункта нет — так и укажи.",
+            "- Структурируй отчёт с заголовками, списками и выводами.",
+            "",
+            "НАКОПЛЕННОЕ РЕЗЮМЕ ДОКУМЕНТА:",
+            summary or "(пусто)",
+        ]
+    )
+
+
+def build_compress_prompt(summary: str, max_len: int) -> str:
+    return "\n".join(
+        [
+            "Сожми следующее промежуточное резюме анализа.",
+            "Сохрани ВСЕ ключевые наблюдения и выводы.",
+            "Убери повторы и воду. Пиши по-русски.",
+            f"Целевой размер: до {max_len} символов.",
+            "",
+            "РЕЗЮМЕ:",
+            summary or "(пусто)",
+        ]
+    )
+
