@@ -180,8 +180,30 @@ st.markdown(
 /* ── Основной контейнер — на всю ширину ── */
 .block-container {
     max-width: 100% !important;
+    width: 100% !important;
     padding-left: 2rem !important;
     padding-right: 2rem !important;
+}
+[data-testid="stAppViewBlockContainer"] {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+}
+.main .block-container,
+.main [data-testid="stAppViewBlockContainer"],
+[data-testid="stMainBlockContainer"] {
+    max-width: 100% !important;
+    width: 100% !important;
+}
+.stMainBlockContainer, .stVerticalBlockBorderWrapper,
+.stVerticalBlock, .stElementContainer {
+    max-width: 100% !important;
+    width: 100% !important;
+}
+[data-testid="stMarkdownContainer"] {
+    max-width: 100% !important;
+    width: 100% !important;
 }
 
 /* ── Скроллбар ── */
@@ -635,18 +657,20 @@ def run_doc_analysis() -> None:
 
     col1, col2, col3 = st.columns([1, 1, 4])
     with col1:
-        if st.button("🚀 Начать", type="primary", key="doc_start"):
-            if not user_goal.strip():
-                st.warning("Опишите задачу анализа.")
-            elif not st.session_state.get("doc_attached_files"):
-                st.warning("Загрузите хотя бы один документ.")
-            elif not st.session_state.get("llm_model"):
-                st.error("Выберите модель в боковой панели.")
-            else:
-                _start_doc_pipeline(user_goal=user_goal)
+        start_clicked = st.button("🚀 Начать", type="primary", key="doc_start")
     with col2:
         if st.button("⏹️ Стоп", key="doc_stop"):
             _set_cancel()
+
+    if start_clicked:
+        if not user_goal.strip():
+            st.warning("Опишите задачу анализа.")
+        elif not st.session_state.get("doc_attached_files"):
+            st.warning("Загрузите хотя бы один документ.")
+        elif not st.session_state.get("llm_model"):
+            st.error("Выберите модель в боковой панели.")
+        else:
+            _start_doc_pipeline(user_goal=user_goal)
 
 
 def _start_doc_pipeline(*, user_goal: str) -> None:
