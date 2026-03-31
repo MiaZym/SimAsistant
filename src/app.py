@@ -4,10 +4,15 @@ UI в стиле ChatGPT с сине-фиолетовой темой.
 """
 from __future__ import annotations
 
+import io
 import re
+from datetime import datetime
 from typing import Any
 
 import streamlit as st
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
 from analyzer import AnalysisCancelled, run_chunked_analysis
 from chunking import ChunkingSettings
@@ -191,6 +196,7 @@ def _init_session_state() -> None:
     st.session_state.setdefault("chat_messages", [])
     st.session_state.setdefault("chat_attached_docs", [])
     st.session_state.setdefault("doc_attached_files", [])
+    st.session_state.setdefault("doc_analysis_result", None)  # Для хранения результата анализа
     st.session_state.setdefault("model_list", [])
     st.session_state.setdefault("ollama_api_type", None)
     st.session_state.setdefault("llm_provider", "ollama")
@@ -271,6 +277,97 @@ def _detect_thinking_block(text: str) -> tuple[str, str]:
             return thinking, answer
 
     return "", text
+
+
+def _convert_markdown_to_docx(markdown_text: str) -> io.BytesIO:
+    """
+    Конвертирует Markdown текст в Word документ (.docx).
+    Возвращает BytesIO объект с содержимым документа.
+    """
+    doc = Document()
+    
+    # Устанавливаем стиль по умолчанию
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = 'Calibri'
+    font.size = Pt(11)
+    
+    lines = markdown_text.split('\n')
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i].rstrip()
+        
+        # Пустая строка
+        if not line:
+            i += 1
+            continue
+        
+        # Заголовок H1 (#)
+        if line.startswith('# '):
+            p = doc.add_heading(line[2:].strip(), level=1)
+            i += 1
+            continue
+        
+        # Заголовок H2 (##)
+        if line.startswith('## '):
+            p = doc.add_heading(line[3:].strip(), level=2)
+            i += 1
+            continue
+        
+        # Заголовок H3 (###)
+        if line.startswith('### '):
+            p = doc.add_heading(line[4:].strip(), level=3)
+            i += 1
+            continue
+        
+        # Заголовок H4 (####)
+        if line.startswith('#### '):
+            p = doc.add_heading(line[5:].strip(), level=4)
+            i += 1
+            continue
+        
+        # Список (-, *, +)
+        if line.lstrip().startswith(('- ', '* ', '+ ')):
+            text = line.lstrip()[2:].strip()
+            # Убираем markdown форматирование жирного и курсива
+            text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+            text = re.sub(r'\*(.+?)\*', r'\1', text)
+            text = re.sub(r'__(.+?)__', r'\1', text)
+            text = re.sub(r'_(.+?)_', r'\1', text)
+            doc.add_paragraph(text, style='List Bullet')
+            i += 1
+            continue
+        
+        # Нумерованный список (1., 2., etc.)
+        if re.match(r'^\s*\d+\.\s', line):
+            text = re.sub(r'^\s*\d+\.\s+', '', line).strip()
+            # Убираем markdown форматирование
+            text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+            text = re.sub(r'\*(.+?)\*', r'\1', text)
+            doc.add_paragraph(text, style='List Number')
+            i += 1
+            continue
+        
+        # Обычный параграф
+        text = line.strip()
+        # Убираем markdown форматирование жирного и курсива
+        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+        text = re.sub(r'\*(.+?)\*', r'\1', text)
+        text = re.sub(r'__(.+?)__', r'\1', text)
+        text = re.sub(r'_(.+?)_', r'\1', text)
+        
+        if text:
+            doc.add_paragraph(text)
+        
+        i += 1
+    
+    # Сохраняем в BytesIO
+    docx_buffer = io.BytesIO()
+    doc.save(docx_buffer)
+    docx_buffer.seek(0)
+    
+    return docx_buffer
 
 
 # ──────────────────────────────────────────────
@@ -591,11 +688,31 @@ def _start_doc_pipeline(*, user_goal: str) -> None:
         progress.progress(100, text="✅ Готово!")
         status.empty()
 
+        # Сохраняем результат в session_state
+        st.session_state["doc_analysis_result"] = result.final_markdown
+
         st.success("Анализ завершён!")
 
-        # Отчёт на всю ширину
+        # Кнопка скачивания
+        try:
+            docx_file = _convert_markdown_to_docx(result.final_markdown)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"Анализ_документов_{timestamp}.docx"
+            
+            st.download_button(
+                label="📥 Скачать отчёт (Word)",
+                data=docx_file,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key="download_doc_report"
+            )
+        except Exception as e:
+            st.warning(f"Не удалось создать Word файл: {e}")
+
+        # Отчёт н всю ширину в контейнере
         st.divider()
-        st.markdown(result.final_markdown)
+        with st.container():
+            st.markdown(result.final_markdown)
         st.divider()
 
         with st.expander("🔍 Детали: план и заметки по частям", expanded=False):
