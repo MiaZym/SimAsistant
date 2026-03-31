@@ -307,6 +307,42 @@ def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("## 🤖 Настройки модели")
 
+        # Выбор провайдера
+        provider_options = ["Ollama", "vLLM"]
+        current_provider = st.session_state.get("llm_provider", "ollama")
+        provider_idx = 0 if current_provider == "ollama" else 1
+        
+        selected_provider = st.selectbox(
+            "Провайдер",
+            provider_options,
+            index=provider_idx,
+            key="sidebar_provider_select",
+        )
+        
+        # Автоматически обновляем провайдер и URL при смене
+        new_provider = "ollama" if selected_provider == "Ollama" else "vllm"
+        if new_provider != st.session_state.get("llm_provider"):
+            st.session_state["llm_provider"] = new_provider
+            # Автоматически обновляем base_url в зависимости от провайдера
+            if new_provider == "ollama":
+                st.session_state["llm_base_url"] = settings.DEFAULT_OLLAMA_URL
+            else:
+                st.session_state["llm_base_url"] = settings.DEFAULT_VLLM_URL
+            # Сбрасываем информацию о моделях
+            st.session_state["models_loaded"] = False
+            st.session_state["model_list"] = []
+            st.session_state["llm_model"] = ""
+            # Автоматически загружаем модели для нового провайдера
+            try:
+                refresh_models()
+            except Exception:
+                pass
+
+        # Отображаем текущий URL
+        st.caption(f"🔗 URL: {st.session_state.get('llm_base_url', 'не установлен')}")
+
+        st.divider()
+
         # Выбор модели
         model_list = st.session_state.get("model_list", []) or []
         if model_list:
