@@ -177,6 +177,13 @@ st.markdown(
     font-size: 0.7rem !important;
 }
 
+/* ── Основной контейнер — на всю ширину ── */
+.block-container {
+    max-width: 100% !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+}
+
 /* ── Скроллбар ── */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
