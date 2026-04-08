@@ -22,19 +22,42 @@ class TranscribeClient:
         *,
         file_bytes: bytes,
         filename: str,
-        file_field: str = "file",
+        file_field: str = "audio_file",
         cancel_check: Optional[callable] = None,
     ) -> TranscriptionResult:
-        files = {
-            file_field: (filename, file_bytes, "audio/wav"),
-        }
+        candidate_fields: list[str] = []
+        for name in (file_field, "file", "audio_file", "audio", "upload_file"):
+            if name and name not in candidate_fields:
+                candidate_fields.append(name)
 
-        resp = requests.post(
-            self.endpoint,
-            files=files,
-            timeout=self.timeout_sec,
-        )
-        resp.raise_for_status()
+        resp: Optional[requests.Response] = None
+        for current_field in candidate_fields:
+            files = {
+                current_field: (filename, file_bytes, "audio/wav"),
+            }
+            resp = requests.post(
+                self.endpoint,
+                files=files,
+                data={"dialogue_id": filename},
+                timeout=self.timeout_sec,
+            )
+            # 422 often means "wrong multipart field name"; try known alternatives.
+            if resp.status_code == 422 and current_field != candidate_fields[-1]:
+                continue
+            break
+
+        assert resp is not None
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            detail = _extract_error_detail(resp)
+            if detail:
+                raise requests.HTTPError(
+                    f"{e}. Service response: {detail}",
+                    response=resp,
+                    request=getattr(e, "request", None),
+                ) from e
+            raise
 
         data = resp.json()
         dialogue_id = str(data.get("dialogue_id") or data.get("dialogueId") or "")
@@ -52,4 +75,18 @@ class TranscribeClient:
 
 class CancelledError(RuntimeError):
     pass
+
+
+def _extract_error_detail(resp: requests.Response) -> str:
+    try:
+        data = resp.json()
+    except Exception:
+        return (resp.text or "").strip()
+
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if detail is not None:
+            return str(detail)
+        return str(data)
+    return str(data)
 
