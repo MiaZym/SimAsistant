@@ -28,11 +28,18 @@ class LLMClient:
         base_url: str,
         timeout_sec: int = 600,
         ollama_api_type: str | None = None,
+        api_key: str | None = None,
     ):
         self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.timeout_sec = timeout_sec
         self.ollama_api_type = ollama_api_type  # native|openai for provider=ollama
+        self.api_key = (api_key or "").strip() or None
+
+    def _openai_headers(self) -> dict[str, str]:
+        if not self.api_key:
+            return {}
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     @staticmethod
     def normalize_provider(provider: str) -> str:
@@ -73,14 +80,22 @@ class LLMClient:
                 models = [m.get("name") for m in (data.get("models") or []) if m.get("name")]
                 return LLMModels(models=models, api_type="native")
 
-            r = requests.get(f"{self.base_url}/v1/models", timeout=self.timeout_sec)
+            r = requests.get(
+                f"{self.base_url}/v1/models",
+                timeout=self.timeout_sec,
+                headers=self._openai_headers(),
+            )
             r.raise_for_status()
             data = r.json() or {}
             models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
             return LLMModels(models=models, api_type="openai")
 
         # vllm or custom: OpenAI compatible
-        r = requests.get(f"{self.base_url}/v1/models", timeout=self.timeout_sec)
+        r = requests.get(
+            f"{self.base_url}/v1/models",
+            timeout=self.timeout_sec,
+            headers=self._openai_headers(),
+        )
         r.raise_for_status()
         data = r.json() or {}
         models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
@@ -94,7 +109,13 @@ class LLMClient:
         return msgs
 
     def _openai_stream(self, *, url: str, payload: dict, cancel_check: Optional[Callable[[], bool]]) -> Generator[str, None, None]:
-        with requests.post(url, json=payload, stream=True, timeout=self.timeout_sec) as resp:
+        with requests.post(
+            url,
+            json=payload,
+            stream=True,
+            timeout=self.timeout_sec,
+            headers=self._openai_headers(),
+        ) as resp:
             resp.raise_for_status()
 
             for line in resp.iter_lines(decode_unicode=True):
@@ -198,7 +219,12 @@ class LLMClient:
         payload = {"model": model, "messages": msgs, "stream": bool(stream), "temperature": temperature}
 
         if not stream:
-            r = requests.post(url, json=payload, timeout=self.timeout_sec)
+            r = requests.post(
+                url,
+                json=payload,
+                timeout=self.timeout_sec,
+                headers=self._openai_headers(),
+            )
             r.raise_for_status()
             data = r.json() or {}
             return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""

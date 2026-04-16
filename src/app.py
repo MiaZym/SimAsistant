@@ -406,8 +406,9 @@ def refresh_models() -> None:
     provider = st.session_state["llm_provider"]
     base_url = st.session_state["llm_base_url"]
     timeout_sec = int(st.session_state.get("llm_timeout_sec", settings.LLM_TIMEOUT_SEC))
+    api_key = settings.VLLM_API_KEY if provider == "vllm" else None
 
-    llm = LLMClient(provider=provider, base_url=base_url, timeout_sec=timeout_sec)
+    llm = LLMClient(provider=provider, base_url=base_url, timeout_sec=timeout_sec, api_key=api_key)
     models_info = llm.list_models()
     st.session_state["model_list"] = models_info.models
     st.session_state["ollama_api_type"] = models_info.api_type
@@ -418,11 +419,14 @@ def refresh_models() -> None:
 
 
 def build_llm() -> LLMClient:
+    provider = st.session_state["llm_provider"]
+    api_key = settings.VLLM_API_KEY if provider == "vllm" else None
     return LLMClient(
-        provider=st.session_state["llm_provider"],
+        provider=provider,
         base_url=st.session_state["llm_base_url"],
         timeout_sec=int(st.session_state.get("llm_timeout_sec", settings.LLM_TIMEOUT_SEC)),
         ollama_api_type=st.session_state.get("ollama_api_type"),
+        api_key=api_key,
     )
 
 
@@ -502,7 +506,7 @@ def render_sidebar() -> None:
         )
 
         st.divider()
-        st.caption("Подключение настраивается через .env файл.")
+        st.caption("Подключение настраивается через .env файл (для vLLM используйте VLLM_API_KEY).")
 
 
 # ──────────────────────────────────────────────

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
 
     DEFAULT_OLLAMA_URL: str = "http://host.docker.internal:11434"
     DEFAULT_VLLM_URL: str = "http://host.docker.internal:8000"
+    VLLM_API_KEY: str | None = None
 
     LLM_TIMEOUT_SEC: int = 600
 
