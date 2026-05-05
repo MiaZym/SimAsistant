@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Generator, Iterable, Optional
+from typing import Any, Callable, Generator, Iterable, Optional
 
 import requests
 
@@ -35,6 +35,51 @@ class LLMClient:
         self.timeout_sec = timeout_sec
         self.ollama_api_type = ollama_api_type  # native|openai for provider=ollama
         self.api_key = (api_key or "").strip() or None
+
+    @staticmethod
+    def _extract_context_window(value: Any) -> int | None:
+        """
+        Пытается достать размер контекстного окна из произвольного JSON.
+        """
+        key_hints = {
+            "context_length",
+            "context_window",
+            "max_context_length",
+            "max_model_len",
+            "max_input_tokens",
+            "n_ctx",
+            "num_ctx",
+            "seq_len",
+            "max_position_embeddings",
+        }
+
+        def walk(obj: Any) -> int | None:
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    key = str(k).lower()
+                    if any(h in key for h in key_hints):
+                        if isinstance(v, int) and v > 0:
+                            return int(v)
+                        if isinstance(v, str):
+                            digits = "".join(ch for ch in v if ch.isdigit())
+                            if digits:
+                                try:
+                                    parsed = int(digits)
+                                    if parsed > 0:
+                                        return parsed
+                                except ValueError:
+                                    pass
+                    nested = walk(v)
+                    if nested:
+                        return nested
+            elif isinstance(obj, list):
+                for item in obj:
+                    nested = walk(item)
+                    if nested:
+                        return nested
+            return None
+
+        return walk(value)
 
     def _openai_headers(self) -> dict[str, str]:
         if not self.api_key:
@@ -100,6 +145,55 @@ class LLMClient:
         data = r.json() or {}
         models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
         return LLMModels(models=models, api_type=None)
+
+    def get_model_context_window(self, model: str) -> int | None:
+        provider = self.normalize_provider(self.provider)
+        model = (model or "").strip()
+        if not model:
+            return None
+
+        try:
+            if provider == "ollama" and self.detect_ollama_api_type() == "native":
+                # 1) Самый точный вариант для Ollama native.
+                show_resp = requests.post(
+                    f"{self.base_url}/api/show",
+                    json={"model": model},
+                    timeout=self.timeout_sec,
+                )
+                if show_resp.ok:
+                    value = self._extract_context_window(show_resp.json() or {})
+                    if value:
+                        return value
+
+                # 2) Фолбэк по /api/tags.
+                tags_resp = requests.get(f"{self.base_url}/api/tags", timeout=self.timeout_sec)
+                if tags_resp.ok:
+                    data = tags_resp.json() or {}
+                    for m in data.get("models") or []:
+                        if m.get("name") == model:
+                            value = self._extract_context_window(m)
+                            if value:
+                                return value
+            else:
+                # OpenAI-compatible APIs (vLLM/custom/Ollama OpenAI mode)
+                models_resp = requests.get(
+                    f"{self.base_url}/v1/models",
+                    timeout=self.timeout_sec,
+                    headers=self._openai_headers(),
+                )
+                if models_resp.ok:
+                    data = models_resp.json() or {}
+                    for m in data.get("data") or []:
+                        if m.get("id") == model:
+                            value = self._extract_context_window(m)
+                            if value:
+                                return value
+                    # Иногда лимиты лежат не у конкретной модели.
+                    return self._extract_context_window(data)
+        except Exception:
+            return None
+
+        return None
 
     def _build_messages(self, system_prompt: str | None, user_prompt: str) -> list[dict]:
         msgs = []

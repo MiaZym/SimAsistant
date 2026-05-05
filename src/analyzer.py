@@ -78,17 +78,13 @@ def run_chunked_analysis(
     else:
         plan = "".join(list(plan_text))
 
-    parsed_plan, params = parse_plan_response(plan)
+    parsed_plan, _ = parse_plan_response(plan)
 
     plan_text_out = parsed_plan or plan
-    chunk_size = params.get("chunk_size") or chunking_settings.chunk_size
-    chunk_overlap = params.get("chunk_overlap") or chunking_settings.chunk_overlap
-    split_strategy = params.get("split_strategy") or chunking_settings.split_strategy
-
     final_chunk_settings = ChunkingSettings(
-        chunk_size=int(chunk_size),
-        chunk_overlap=int(chunk_overlap),
-        split_strategy=str(split_strategy),
+        chunk_size=int(chunking_settings.chunk_size),
+        chunk_overlap=int(chunking_settings.chunk_overlap),
+        split_strategy=str(chunking_settings.split_strategy),
         custom_separator=chunking_settings.custom_separator,
     )
 
@@ -141,7 +137,7 @@ def run_chunked_analysis(
         )
 
         # Auto-compress if summary grows too much.
-        max_summary_size = int(chunk_size * 0.6)
+        max_summary_size = int(final_chunk_settings.chunk_size * 0.6)
         if cumulative_summary and len(cumulative_summary) > max_summary_size and i < total:
             if cancel_check and cancel_check():
                 raise AnalysisCancelled()

@@ -5,25 +5,19 @@ def build_plan_prompt(*, analysis_mode: str, user_goal: str, sample_text: str) -
     """
     Возвращает prompt, который просит модель:
     1) составить план анализа
-    2) предложить параметры чанкирования
 
-    Вывод строго в markers:
-    ===PLAN=== ... ===PARAMS=== ...
+    Вывод строго в markers: ===PLAN=== ... ===END===
     """
     base = [
         "Ты — аналитик. Нужно составить план анализа большого текста по задаче пользователя.",
         "Текст очень большой и будет разделён на чанки. На этапе плана НЕ анализируй весь документ целиком — используй только sample.",
         "",
         "Сначала верни план: что и в каком порядке нужно искать/сопоставлять, какие разделы итогового отчёта будут.",
-        "Затем предложи параметры чанкирования, чтобы модель успевала обрабатывать части.",
         "",
         "ВЫХОД СТРОГО В ФОРМАТЕ:",
         "===PLAN===",
         "[пошаговый план и структура результата]",
-        "===PARAMS===",
-        "chunk_size: <число>",
-        "chunk_overlap: <число>",
-        "split_strategy: <smart|separator|paragraphs|chars>",
+        "===END===",
     ]
 
     if analysis_mode == "spike":
@@ -62,47 +56,12 @@ def parse_plan_response(text: str) -> tuple[str, dict]:
     raw = (text or "").strip()
     import re
 
-    plan_match = re.search(r"===PLAN===([\s\S]*?)===PARAMS===", raw, flags=re.IGNORECASE)
-    params_match = re.search(r"===PARAMS===([\s\S]*?)===END===", raw, flags=re.IGNORECASE)
-    if not params_match:
-        params_match = re.search(r"===PARAMS===([\s\S]*)", raw, flags=re.IGNORECASE)
+    plan_match = re.search(r"===PLAN===([\s\S]*?)===END===", raw, flags=re.IGNORECASE)
+    if not plan_match:
+        plan_match = re.search(r"===PLAN===([\s\S]*)", raw, flags=re.IGNORECASE)
 
     plan = plan_match.group(1).strip() if plan_match else ""
-    params_raw = params_match.group(1) if params_match else ""
-
-    chunk_size = _extract_int(r"chunk_size\s*:\s*(\d+)", params_raw)
-    chunk_overlap = _extract_int(r"chunk_overlap\s*:\s*(\d+)", params_raw)
-    split_strategy_raw = _extract_str(r"split_strategy\s*:\s*([a-z_]+)", params_raw)
-
-    allowed = {"smart", "separator", "paragraphs", "chars"}
-    split_strategy = split_strategy_raw if split_strategy_raw in allowed else None
-
-    return plan or raw, {
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "split_strategy": split_strategy,
-    }
-
-
-def _extract_int(pattern: str, text: str):
-    import re
-
-    m = re.search(pattern, text or "", flags=re.IGNORECASE)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
-
-
-def _extract_str(pattern: str, text: str):
-    import re
-
-    m = re.search(pattern, text or "", flags=re.IGNORECASE)
-    if not m:
-        return None
-    return str(m.group(1)).strip()
+    return plan or raw, {}
 
 
 def build_chunk_prompt(
