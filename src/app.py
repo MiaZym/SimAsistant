@@ -498,7 +498,8 @@ def _build_transcriptions_docx(transcripts: list[dict[str, str]]) -> io.BytesIO:
 
     doc.add_heading("Транскрибация диалогов", level=1)
 
-    for item in transcripts:
+    total = len(transcripts)
+    for idx, item in enumerate(transcripts, start=1):
         filename = (item.get("filename") or "").strip() or "Без названия"
         transcript = (item.get("transcript") or "").strip()
 
@@ -512,6 +513,10 @@ def _build_transcriptions_docx(transcripts: list[dict[str, str]]) -> io.BytesIO:
 
         # Отступ между файлами
         doc.add_paragraph("")
+        # Явный разделитель между диалогами
+        if idx < total:
+            doc.add_paragraph("────────────────────────────────────────")
+            doc.add_paragraph("")
 
     docx_buffer = io.BytesIO()
     doc.save(docx_buffer)
