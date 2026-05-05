@@ -1125,6 +1125,7 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
     status = st.empty()
 
     transcripts: list[dict[str, str]] = []
+    failed_files: list[str] = []
     total_files = len(uploaded_wavs)
 
     try:
@@ -1139,32 +1140,31 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
             status.write(f"🎙️ Транскрибация {i}/{total_files}: {filename}")
             progress.progress(int(i / total_files * 100), text=f"🎙️ Транскрибация {i}/{total_files}...")
 
-            resp = transcribe_client.transcribe_wav(
-                file_bytes=file_bytes,
-                filename=filename,
-                file_field=file_field,
-                cancel_check=cancel_check,
-            )
+            try:
+                resp = transcribe_client.transcribe_wav(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    file_field=file_field,
+                    cancel_check=cancel_check,
+                )
+            except Exception:
+                failed_files.append(filename)
+                continue
 
-            transcripts.append(
-                {
-                    "filename": filename,
-                    "transcript": (resp.transcript or "").strip(),
-                }
-            )
+            transcripts.append({"filename": filename, "transcript": (resp.transcript or "").strip()})
     except TranscribeCancelledError:
         st.info("⏹️ Обработка остановлена.")
         return
-    except Exception as e:
-        status.empty()
-        st.error(
-            f"Ошибка сервиса транскрибации: {e}. Анализ остановлен. "
-            "Проверьте сервис транскрибации или попробуйте позже."
-        )
-        return
 
     if not transcripts:
-        st.error("Не удалось получить транскрибации. Проверьте сервис транскрибации или попробуйте позже.")
+        status.empty()
+        if failed_files:
+            st.warning(
+                "Некоторые файлы не удалось транскрибировать: "
+                + ", ".join(failed_files)
+                + ". Проверьте сервис транскрибации или попробуйте позже."
+            )
+        st.error("Не удалось получить ни одной успешной транскрибации.")
         return
 
     try:
@@ -1176,6 +1176,12 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
     status.empty()
     progress.progress(100, text="✅ Готово!")
     st.success("Транскрибация завершена. Файл готов к скачиванию.")
+    if failed_files:
+        st.warning(
+            "Не удалось транскрибировать некоторые файлы: "
+            + ", ".join(failed_files)
+            + ". Они пропущены и не включены в Word-файл."
+        )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"Транскрибация_диалогов_{timestamp}.docx"
