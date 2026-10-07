@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import io
 import os
-from dataclasses import dataclass
-from typing import Literal
 
 import pandas as pd
-from pypdf import PdfReader
 from docx import Document
+from pypdf import PdfReader
 
 
 def extract_text(filename: str, file_bytes: bytes) -> str:
@@ -61,7 +59,7 @@ def _extract_docx(file_bytes: bytes) -> str:
     return "\n".join(parts).strip()
 
 
-def _extract_excel(file_bytes: bytes, filename: str) -> str:
+def _extract_excel(file_bytes: bytes, _filename: str) -> str:
     # pandas обычно работает с xlsx via openpyxl; для xls может понадобиться другой engine
     bio = io.BytesIO(file_bytes)
     with pd.ExcelFile(bio) as xls:

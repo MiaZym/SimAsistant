@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "simassistant"
+version = "0.1.0"
+description = "Прототип LLM-сервиса: чат, анализ больших документов, разбор звонков"
+authors = ["SimAssistant contributors"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+streamlit = ">=1.40,<2"
+requests = ">=2.32,<3"
+pydantic = ">=2.8,<3"
+pydantic-settings = ">=2.4,<3"
+pypdf = ">=4.2,<6"
+python-docx = ">=1.1,<2"
+pandas = ">=2.2,<3"
+openpyxl = ">=3.1,<4"
+fpdf2 = ">=2.7,<3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8"
+ruff = ">=0.6"
+
+# Корпоративные зеркальные индексы (для test-развёртывания во внутреннем контуре).
+# priority=primary: все пакеты берутся отсюда, публичный PyPI (недоступен) не нужен.
+# ВНИМАНИЕ: для публикации на GitHub убрать эти блоки и poetry.lock,
+# а Dockerfile — на базовый образ python:3.11-slim.
+[[tool.poetry.source]]
+name = "artifactory-common"
+url = "https://artifactory.corp.ingos.ru/api/pypi/common-python/simple"
+priority = "primary"
+
+[[tool.poetry.source]]
+name = "artifactory-mlops"
+url = "https://artifactory.corp.ingos.ru/api/pypi/mlops-python-local/simple"
+priority = "primary"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Тексты промптов — длинные строки, перенос исказил бы промпт
+"src/prompts.py" = ["E501"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

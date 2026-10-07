@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
-from chunking import ChunkingSettings, make_chunks  # type: ignore
-from llm_client import CancelledError, LLMClient
+from chunking import ChunkingSettings, make_chunks
+from exceptions import CancelledError
+from llm_client import GenerationParams, LLMClient
 from prompts import (
     build_chunk_prompt,
     build_compress_prompt,
@@ -34,7 +35,7 @@ class AnalysisResult:
     cumulative_summary: str
 
 
-def _should_cancel(cancel_check: Optional[Callable[[], bool]]) -> bool:
+def _should_cancel(cancel_check: Callable[[], bool] | None) -> bool:
     return bool(cancel_check and cancel_check())
 
 
@@ -47,10 +48,10 @@ def run_chunked_analysis(
     user_goal: str,
     full_text: str,
     chunking_settings: ChunkingSettings,
-    temperature: float,
-    cancel_check: Optional[Callable[[], bool]] = None,
-    final_stream_callback: Optional[Callable[[str], None]] = None,
-    on_chunk_start: Optional[Callable[[int, int], None]] = None,
+    generation: GenerationParams,
+    cancel_check: Callable[[], bool] | None = None,
+    final_stream_callback: Callable[[str], None] | None = None,
+    on_chunk_start: Callable[[int, int], None] | None = None,
 ) -> AnalysisResult:
     """
     Универсальная логика:
@@ -69,14 +70,11 @@ def run_chunked_analysis(
         user_prompt=build_plan_prompt(
             analysis_mode=analysis_mode, user_goal=user_goal, sample_text=sample_text
         ),
-        temperature=temperature,
+        generation=generation,
         stream=False,
         cancel_check=cancel_check,
     )
-    if isinstance(plan_text, str):
-        plan = plan_text
-    else:
-        plan = "".join(list(plan_text))
+    plan = plan_text if isinstance(plan_text, str) else "".join(list(plan_text))
 
     parsed_plan, _ = parse_plan_response(plan)
 
@@ -117,7 +115,7 @@ def run_chunked_analysis(
             model=model,
             system_prompt=system_prompt,  # передаём на каждом чанке для сохранения контекста
             user_prompt=user_prompt,
-            temperature=temperature,
+            generation=generation,
             stream=False,
             cancel_check=cancel_check,
         )
@@ -146,7 +144,7 @@ def run_chunked_analysis(
                 model=model,
                 system_prompt="",
                 user_prompt=build_compress_prompt(cumulative_summary, max_summary_size),
-                temperature=min(0.8, temperature),
+                generation=replace(generation, temperature=min(0.8, generation.temperature)),
                 stream=False,
                 cancel_check=cancel_check,
             )
@@ -166,7 +164,7 @@ def run_chunked_analysis(
             model=model,
             system_prompt=system_prompt,
             user_prompt=final_prompt,
-            temperature=temperature,
+            generation=generation,
             stream=True,
             cancel_check=cancel_check,
         )

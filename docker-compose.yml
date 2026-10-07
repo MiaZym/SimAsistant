@@ -3,18 +3,34 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-python:3.11-slim}
+    image: simassistant:latest
     ports:
-      - "8501:8501"
+      - "${HOST_PORT:-8501}:8501"
     environment:
-      # Container -> host network mapping
+      # Транскрибация (опционально)
       TRANSCRIBE_URL: ${TRANSCRIBE_URL:-http://host.docker.internal:8077/api/v1/transcribe}
       TRANSCRIBE_FILE_FIELD: ${TRANSCRIBE_FILE_FIELD:-file}
 
-      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      VLLM_URL: ${VLLM_URL:-http://host.docker.internal:8000}
+      # Провайдеры LLM по умолчанию
+      DEFAULT_OLLAMA_URL: ${DEFAULT_OLLAMA_URL:-http://host.docker.internal:11434}
+      DEFAULT_VLLM_URL: ${DEFAULT_VLLM_URL:-http://host.docker.internal:8000}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_EXTRA_HEADERS: ${VLLM_EXTRA_HEADERS:-}
+
+      DEFAULT_CUSTOM_URL: ${DEFAULT_CUSTOM_URL:-https://api.openai.com}
+      DEFAULT_CUSTOM_API_KEY: ${DEFAULT_CUSTOM_API_KEY:-}
+      DEFAULT_CUSTOM_MODELS: ${DEFAULT_CUSTOM_MODELS:-}
+      DEFAULT_CUSTOM_EXTRA_HEADERS: ${DEFAULT_CUSTOM_EXTRA_HEADERS:-}
 
       LLM_TIMEOUT_SEC: ${LLM_TIMEOUT_SEC:-600}
+
+      # Для сервисов с внутренним (self-signed/корпоративным) TLS укажите
+      # путь к CA-бандлу внутри контейнера. Пусто по умолчанию -> certifi.
+      REQUESTS_CA_BUNDLE: ${REQUESTS_CA_BUNDLE:-}
+      SSL_CERT_FILE: ${SSL_CERT_FILE:-}
     extra_hosts:
+      # Доступ к хост-машине из контейнера (Linux)
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
-
