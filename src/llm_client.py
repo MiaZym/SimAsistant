@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Iterable, Optional
+from typing import Any
 
 import requests
 
+from exceptions import CancelledError
 
-class CancelledError(RuntimeError):
-    pass
+__all__ = ["LLMClient", "LLMModels", "CancelledError"]
 
 
-def _should_cancel(cancel_check: Optional[Callable[[], bool]]) -> bool:
+def _should_cancel(cancel_check: Callable[[], bool] | None) -> bool:
     return bool(cancel_check and cancel_check())
+
+
+@dataclass(frozen=True)
+class GenerationParams:
+    """Параметры генерации. Значения None означают «использовать настройки сервера»."""
+
+    temperature: float = 0.2
+    top_p: float | None = None
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -29,12 +40,15 @@ class LLMClient:
         timeout_sec: int = 600,
         ollama_api_type: str | None = None,
         api_key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.provider = provider
         self.base_url = base_url.rstrip("/")
         self.timeout_sec = timeout_sec
         self.ollama_api_type = ollama_api_type  # native|openai for provider=ollama
         self.api_key = (api_key or "").strip() or None
+        # Доп. заголовки запросов (например, X-Gateway-Api-Key для API-шлюзов)
+        self.extra_headers = {k: v for k, v in (extra_headers or {}).items() if k and v}
 
     @staticmethod
     def _extract_context_window(value: Any) -> int | None:
@@ -82,9 +96,14 @@ class LLMClient:
         return walk(value)
 
     def _openai_headers(self) -> dict[str, str]:
-        if not self.api_key:
-            return {}
-        return {"Authorization": f"Bearer {self.api_key}"}
+        headers = dict(self.extra_headers)
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _native_headers(self) -> dict[str, str]:
+        # Нативный Ollama обычно без Authorization, но шлюзовые заголовки пригодятся
+        return dict(self.extra_headers)
 
     @staticmethod
     def normalize_provider(provider: str) -> str:
@@ -97,10 +116,10 @@ class LLMClient:
         if self.ollama_api_type in {"native", "openai"}:
             return self.ollama_api_type
 
-        # Try native Ollama: /api/tags + /api/chat returns NDJSON chunks
+        # Try native Ollama: /api/tags returns NDJSON-capable model list
         try:
             url = f"{self.base_url}/api/tags"
-            r = requests.get(url, timeout=self.timeout_sec)
+            r = requests.get(url, timeout=min(10, self.timeout_sec), headers=self._native_headers())
             if r.ok:
                 data = r.json() or {}
                 models = data.get("models") or []
@@ -119,7 +138,7 @@ class LLMClient:
         if provider == "ollama":
             api_type = self.detect_ollama_api_type()
             if api_type == "native":
-                r = requests.get(f"{self.base_url}/api/tags", timeout=self.timeout_sec)
+                r = requests.get(f"{self.base_url}/api/tags", timeout=self.timeout_sec, headers=self._native_headers())
                 r.raise_for_status()
                 data = r.json() or {}
                 models = [m.get("name") for m in (data.get("models") or []) if m.get("name")]
@@ -135,7 +154,7 @@ class LLMClient:
             models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
             return LLMModels(models=models, api_type="openai")
 
-        # vllm or custom: OpenAI compatible
+        # vLLM / custom: OpenAI-compatible /v1/models
         r = requests.get(
             f"{self.base_url}/v1/models",
             timeout=self.timeout_sec,
@@ -159,6 +178,7 @@ class LLMClient:
                     f"{self.base_url}/api/show",
                     json={"model": model},
                     timeout=self.timeout_sec,
+                    headers=self._native_headers(),
                 )
                 if show_resp.ok:
                     value = self._extract_context_window(show_resp.json() or {})
@@ -166,7 +186,11 @@ class LLMClient:
                         return value
 
                 # 2) Фолбэк по /api/tags.
-                tags_resp = requests.get(f"{self.base_url}/api/tags", timeout=self.timeout_sec)
+                tags_resp = requests.get(
+                    f"{self.base_url}/api/tags",
+                    timeout=self.timeout_sec,
+                    headers=self._native_headers(),
+                )
                 if tags_resp.ok:
                     data = tags_resp.json() or {}
                     for m in data.get("models") or []:
@@ -195,14 +219,49 @@ class LLMClient:
 
         return None
 
-    def _build_messages(self, system_prompt: str | None, user_prompt: str) -> list[dict]:
-        msgs = []
+    @staticmethod
+    def _build_messages(system_prompt: str | None, user_prompt: str) -> list[dict]:
+        msgs: list[dict] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
         msgs.append({"role": "user", "content": user_prompt})
         return msgs
 
-    def _openai_stream(self, *, url: str, payload: dict, cancel_check: Optional[Callable[[], bool]]) -> Generator[str, None, None]:
+    @staticmethod
+    def _openai_payload(
+        model: str, msgs: list[dict], stream: bool, params: GenerationParams
+    ) -> dict:
+        payload: dict = {
+            "model": model,
+            "messages": msgs,
+            "stream": bool(stream),
+            "temperature": float(params.temperature),
+        }
+        if params.top_p is not None:
+            payload["top_p"] = float(params.top_p)
+        if params.max_tokens is not None:
+            payload["max_tokens"] = int(params.max_tokens)
+        return payload
+
+    @staticmethod
+    def _ollama_payload(
+        model: str, msgs: list[dict], stream: bool, params: GenerationParams
+    ) -> dict:
+        options: dict = {"temperature": float(params.temperature)}
+        if params.top_p is not None:
+            options["top_p"] = float(params.top_p)
+        if params.max_tokens is not None:
+            options["num_predict"] = int(params.max_tokens)
+        return {
+            "model": model,
+            "messages": msgs,
+            "stream": bool(stream),
+            "options": options,
+        }
+
+    def _openai_stream(
+        self, *, url: str, payload: dict, cancel_check: Callable[[], bool] | None
+    ) -> Generator[str, None, None]:
         with requests.post(
             url,
             json=payload,
@@ -217,24 +276,15 @@ class LLMClient:
                     resp.close()
                     raise CancelledError()
 
-                if not line:
-                    continue
-                if not line.startswith("data:"):
+                if not line or not line.startswith("data:"):
                     continue
                 data = line[len("data:") :].strip()
                 if data == "[DONE]":
                     break
                 try:
-                    import json
-
                     chunk = json.loads(data)
-                except Exception:
-                    try:
-                        import json
-
-                        chunk = json.loads(data)
-                    except Exception:
-                        continue
+                except (ValueError, TypeError):
+                    continue
 
                 delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
                 content = delta.get("content")
@@ -242,9 +292,15 @@ class LLMClient:
                     yield content
 
     def _ollama_native_stream(
-        self, *, url: str, payload: dict, cancel_check: Optional[Callable[[], bool]]
+        self, *, url: str, payload: dict, cancel_check: Callable[[], bool] | None
     ) -> Generator[str, None, None]:
-        with requests.post(url, json=payload, stream=True, timeout=self.timeout_sec) as resp:
+        with requests.post(
+            url,
+            json=payload,
+            stream=True,
+            timeout=self.timeout_sec,
+            headers=self._native_headers(),
+        ) as resp:
             resp.raise_for_status()
 
             for line in resp.iter_lines(decode_unicode=True):
@@ -254,16 +310,9 @@ class LLMClient:
                 if not line:
                     continue
                 try:
-                    import json
-
                     chunk = json.loads(line)
-                except Exception:
-                    try:
-                        import json
-
-                        chunk = json.loads(line)
-                    except Exception:
-                        continue
+                except (ValueError, TypeError):
+                    continue
 
                 content = (chunk.get("message") or {}).get("content")
                 if content:
@@ -275,9 +324,9 @@ class LLMClient:
         model: str,
         system_prompt: str | None,
         user_prompt: str,
-        temperature: float = 0.2,
+        generation: GenerationParams | None = None,
         stream: bool = False,
-        cancel_check: Optional[Callable[[], bool]] = None,
+        cancel_check: Callable[[], bool] | None = None,
         messages: list[dict] | None = None,
     ) -> str | Generator[str, None, None]:
         """
@@ -288,29 +337,30 @@ class LLMClient:
         Иначе формируется из system_prompt + user_prompt.
         """
         provider = self.normalize_provider(self.provider)
-        if messages:
+        if messages is not None:
             msgs: list[dict] = []
             if system_prompt:
                 msgs.append({"role": "system", "content": system_prompt})
             msgs.extend(messages)
         else:
             msgs = self._build_messages(system_prompt, user_prompt)
-        temperature = float(temperature)
+
+        params = generation or GenerationParams()
 
         if provider == "ollama" and self.detect_ollama_api_type() == "native":
             url = f"{self.base_url}/api/chat"
-            payload = {"model": model, "messages": msgs, "stream": bool(stream), "options": {"temperature": temperature}}
+            payload = self._ollama_payload(model, msgs, stream, params)
             if not stream:
-                r = requests.post(url, json=payload, timeout=self.timeout_sec)
+                r = requests.post(url, json=payload, timeout=self.timeout_sec, headers=self._native_headers())
                 r.raise_for_status()
                 data = r.json() or {}
                 return (data.get("message") or {}).get("content") or ""
 
             return self._ollama_native_stream(url=url, payload=payload, cancel_check=cancel_check)
 
-        # OpenAI compatible endpoint
+        # OpenAI-compatible endpoint (vLLM / custom / Ollama in OpenAI mode)
         url = f"{self.base_url}/v1/chat/completions"
-        payload = {"model": model, "messages": msgs, "stream": bool(stream), "temperature": temperature}
+        payload = self._openai_payload(model, msgs, stream, params)
 
         if not stream:
             r = requests.post(
@@ -324,4 +374,3 @@ class LLMClient:
             return ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
 
         return self._openai_stream(url=url, payload=payload, cancel_check=cancel_check)
-

@@ -1,29 +1,42 @@
 """
-LLM Service — чат, анализ документов, анализ звонков.
-UI в стиле ChatGPT с сине-фиолетовой темой.
+SimAssistant — чат с LLM, анализ документов и обработка звонков.
+Провайдеры: Ollama, vLLM, любой OpenAI-compatible API.
 """
 from __future__ import annotations
 
-import io
-import re
+import contextlib
+import html
+import inspect
+import time
 from datetime import datetime
 from typing import Any
 
 import streamlit as st
-from docx import Document
-from docx.shared import Pt, RGBColor
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 
 from analyzer import AnalysisCancelled, run_chunked_analysis
 from chunking import ChunkingSettings
 from config import settings
 from document_extractors import extract_text
-from llm_client import CancelledError, LLMClient
-from transcribe_client import CancelledError as TranscribeCancelledError
+from exceptions import CancelledError
+from exporters import chat_to_pdf, markdown_to_docx, transcriptions_to_docx
+from llm_client import GenerationParams, LLMClient
+from styles import CUSTOM_CSS, DARK_CSS
 from transcribe_client import TranscribeClient
+from utils import detect_thinking_block, format_int, friendly_llm_error
+
+# st.chat_input с файлами появился в streamlit 1.44
+_CHAT_FILES_SUPPORTED = "accept_file" in inspect.signature(st.chat_input).parameters
+# Прокручиваемый контейнер фиксированной высоты и width="stretch" — новые API
+_CONTAINER_HEIGHT_SUPPORTED = "height" in inspect.signature(st.container).parameters
+_BUTTON_WIDTH_KW = (
+    {"width": "stretch"}
+    if "width" in inspect.signature(st.button).parameters
+    else {"use_container_width": True}
+)
+_CHAT_HISTORY_PX = 560
 
 # ──────────────────────────────────────────────
-# Параметры анализа (зашиты в код, пользователь не видит)
+# Параметры анализа по умолчанию (можно менять в UI)
 # ──────────────────────────────────────────────
 DOC_CHUNK_SIZE = 12_000
 DOC_CHUNK_OVERLAP = 400
@@ -36,196 +49,111 @@ CALLS_SPLIT_STRATEGY = "paragraphs"
 CALLS_CUSTOM_SEPARATOR = r"_{3,}|-{3,}|={3,}"
 
 DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TOP_P = 0.95
+
+# ──────────────────────────────────────────────
+# Провайдеры LLM
+# ──────────────────────────────────────────────
+PROVIDER_LABELS = {
+    "ollama": "Ollama",
+    "vllm": "vLLM",
+    "custom": "Custom API (OpenAI-compatible)",
+}
+PROVIDER_BY_LABEL = {label: key for key, label in PROVIDER_LABELS.items()}
+
+# ──────────────────────────────────────────────
+# Шаблоны задач анализа
+# ──────────────────────────────────────────────
+NO_PRESET = "— без шаблона —"
+
+DOC_PRESETS = {
+    NO_PRESET: "",
+    "Краткое резюме (exec summary)": (
+        "Составь краткое резюме документов: цель, ключевые тезисы, важные цифры и выводы. До 300 слов."
+    ),
+    "Риски и обязательства": (
+        "Найди все риски, обязательства, сроки и условия.\nДля каждого — цитату и место в документе."
+    ),
+    "Ключевые цифры и метрики": (
+        "Вытащи все числовые метрики и факты в таблицу: значение, контекст, раздел/страница источника."
+    ),
+}
+
+CALLS_PRESETS = {
+    NO_PRESET: "",
+    "Причины обращений": (
+        "Определи основные причины обращений клиентов, сгруппируй их и оцени относительную частоту каждой группы."
+    ),
+    "Referral-анализ": (
+        "Найди все случаи перенаправления между компаниями/подразделениями:\n"
+        "кто кого направил и какими словами это сказано."
+    ),
+    "Недовольство и эскалации": (
+        "Отметь проявления недовольства клиентов, угрозы жалоб и эскалации — с цитатами и dialogue_id."
+    ),
+}
+
+
+def _apply_task_preset(presets: dict[str, str], preset_key: str, goal_key: str) -> None:
+    selected = st.session_state.get(preset_key, NO_PRESET)
+    if selected and selected != NO_PRESET:
+        st.session_state[goal_key] = presets[selected]
+
+
+_PROBE_TTL_SEC = 30
+
+
+def _probe_provider(provider: str, base_url: str, api_key: str) -> tuple[bool, str, int]:
+    """
+    Проверка доступности провайдера. Ручной кэш на 30 с в session_state:
+    возвращает (ок, описание, сколько секунд назад проверяли).
+    """
+    now = time.time()
+    cache = st.session_state.get("_probe_cache")
+    sig = (provider, base_url, api_key)
+    if cache and cache["sig"] == sig and now - cache["ts"] < _PROBE_TTL_SEC:
+        return cache["ok"], cache["info"], int(now - cache["ts"])
+    try:
+        llm = LLMClient(
+            provider=provider,
+            base_url=base_url,
+            timeout_sec=6,
+            api_key=api_key or None,
+            extra_headers=settings.extra_headers_for(provider),
+        )
+        models = llm.list_models()
+        ok, info = True, f"на связи, моделей: {len(models.models)}"
+    except Exception as e:
+        ok, info = False, str(e)[:140]
+    st.session_state["_probe_cache"] = {"sig": sig, "ts": now, "ok": ok, "info": info}
+    return ok, info, 0
+
+
+def _default_base_url(provider: str) -> str:
+    if provider == "ollama":
+        return settings.DEFAULT_OLLAMA_URL
+    if provider == "vllm":
+        return settings.DEFAULT_VLLM_URL
+    return settings.DEFAULT_CUSTOM_URL
+
 
 # ──────────────────────────────────────────────
 # Streamlit page config
 # ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI Ассистент",
+    page_title="SimAssistant",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="auto",
 )
 
-# ──────────────────────────────────────────────
-# Кастомные CSS-стили (сине-фиолетовая тема)
-# ──────────────────────────────────────────────
-st.markdown(
-    """
-<style>
-/* ── Общий фон ── */
-.stApp {
-    background: linear-gradient(160deg, #0F0A1E 0%, #1a1145 50%, #0d1b3e 100%);
-}
+def _current_theme() -> str:
+    return st.session_state.get("ui_theme", "dark")
 
-/* ── Sidebar ── */
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #1E1640 0%, #0F0A1E 100%) !important;
-    border-right: 1px solid rgba(124, 58, 237, 0.2) !important;
-}
-[data-testid="stSidebar"] .stSelectbox label,
-[data-testid="stSidebar"] .stTextArea label {
-    color: #A78BFA !important;
-    font-weight: 600 !important;
-}
 
-/* ── Чат-сообщения ── */
-.stChatMessage {
-    border-radius: 16px !important;
-    margin-bottom: 8px !important;
-}
-[data-testid="stChatMessageContent"] {
-    border-radius: 16px !important;
-}
-
-/* ── Кнопки (обычные) ── */
-.stButton > button {
-    background: linear-gradient(135deg, #7C3AED, #4F46E5) !important;
-    color: #fff !important;
-    border: none !important;
-    border-radius: 10px !important;
-    padding: 4px 14px !important;
-    font-weight: 600 !important;
-    font-size: 0.85rem !important;
-    transition: all 0.2s ease !important;
-}
-.stButton > button:hover {
-    background: linear-gradient(135deg, #6D28D9, #4338CA) !important;
-    box-shadow: 0 4px 16px rgba(124, 58, 237, 0.35) !important;
-    transform: translateY(-1px) !important;
-}
-
-/* ── Кнопка primary (Начать анализ) ── */
-.stButton > button[kind="primary"] {
-    padding: 6px 20px !important;
-    font-size: 0.9rem !important;
-}
-
-/* ── Инпуты ── */
-.stTextInput > div > div > input,
-.stTextArea > div > div > textarea,
-.stSelectbox > div > div {
-    background: rgba(30, 22, 64, 0.6) !important;
-    border: 1px solid rgba(124, 58, 237, 0.3) !important;
-    border-radius: 12px !important;
-    color: #E2D9F3 !important;
-}
-
-/* ── Chat input ── */
-[data-testid="stChatInput"] {
-    background: rgba(30, 22, 64, 0.6) !important;
-    border: 1px solid rgba(124, 58, 237, 0.3) !important;
-    border-radius: 16px !important;
-}
-[data-testid="stChatInput"] textarea {
-    color: #E2D9F3 !important;
-}
-
-/* ── Табы ── */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 4px;
-    background: rgba(30, 22, 64, 0.5);
-    border-radius: 14px;
-    padding: 4px;
-}
-.stTabs [data-baseweb="tab"] {
-    border-radius: 10px !important;
-    color: #A78BFA !important;
-    font-weight: 600 !important;
-    padding: 8px 24px !important;
-}
-.stTabs [aria-selected="true"] {
-    background: linear-gradient(135deg, #7C3AED, #4F46E5) !important;
-    color: #fff !important;
-}
-
-/* ── Expander (toggle) ── */
-.streamlit-expanderHeader {
-    background: rgba(30, 22, 64, 0.6) !important;
-    border-radius: 12px !important;
-    color: #A78BFA !important;
-    font-weight: 600 !important;
-}
-
-/* ── Progress bar ── */
-.stProgress > div > div > div {
-    background: linear-gradient(90deg, #7C3AED, #4F46E5) !important;
-    border-radius: 8px !important;
-}
-
-/* ── File uploader — компактный ── */
-[data-testid="stFileUploader"] {
-    border: 1px dashed rgba(124, 58, 237, 0.3) !important;
-    border-radius: 12px !important;
-    padding: 8px 12px !important;
-}
-[data-testid="stFileUploader"] section {
-    padding: 0 !important;
-}
-[data-testid="stFileUploader"] section > div {
-    padding-top: 0 !important;
-    padding-bottom: 0 !important;
-}
-/* Скрыть большой текст drag-and-drop */
-[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] {
-    padding: 8px !important;
-}
-[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] > div > div {
-    font-size: 0.8rem !important;
-}
-[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] small {
-    font-size: 0.7rem !important;
-}
-
-/* ── Основной контейнер — на всю ширину ── */
-.block-container {
-    max-width: 100% !important;
-    width: 100% !important;
-    padding-left: 2rem !important;
-    padding-right: 2rem !important;
-}
-[data-testid="stAppViewBlockContainer"] {
-    max-width: 100% !important;
-    width: 100% !important;
-    padding-left: 2rem !important;
-    padding-right: 2rem !important;
-}
-.main .block-container,
-.main [data-testid="stAppViewBlockContainer"],
-[data-testid="stMainBlockContainer"] {
-    max-width: 100% !important;
-    width: 100% !important;
-}
-.stMainBlockContainer, .stVerticalBlockBorderWrapper,
-.stVerticalBlock, .stElementContainer {
-    max-width: 100% !important;
-    width: 100% !important;
-}
-[data-testid="stMarkdownContainer"] {
-    max-width: 100% !important;
-    width: 100% !important;
-}
-/* Таблицы в markdown: не сжимать отчёты */
-[data-testid="stMarkdownContainer"] table {
-    width: 100% !important;
-    table-layout: fixed !important;
-}
-[data-testid="stMarkdownContainer"] table th,
-[data-testid="stMarkdownContainer"] table td {
-    white-space: pre-wrap !important;
-    word-break: break-word !important;
-    font-size: 0.95rem !important;
-}
-
-/* ── Скроллбар ── */
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(124, 58, 237, 0.3); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: rgba(124, 58, 237, 0.5); }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+if _current_theme() == "dark":
+    st.markdown(DARK_CSS, unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────
@@ -234,20 +162,27 @@ st.markdown(
 def _init_session_state() -> None:
     st.session_state.setdefault("cancel", False)
     st.session_state.setdefault("chat_messages", [])
-    st.session_state.setdefault("chat_attached_docs", [])
     st.session_state.setdefault("doc_attached_files", [])
-    st.session_state.setdefault("doc_analysis_result", None)  # Для хранения результата анализа
     st.session_state.setdefault("model_list", [])
     st.session_state.setdefault("ollama_api_type", None)
     st.session_state.setdefault("llm_provider", "ollama")
     st.session_state.setdefault("llm_base_url", settings.DEFAULT_OLLAMA_URL)
     st.session_state.setdefault("llm_model", "")
+    st.session_state.setdefault("custom_api_key", settings.DEFAULT_CUSTOM_API_KEY or "")
     st.session_state.setdefault("system_prompt", "")
     st.session_state.setdefault("temperature", DEFAULT_TEMPERATURE)
+    st.session_state.setdefault("top_p", DEFAULT_TOP_P)
+    st.session_state.setdefault("max_tokens", 0)
     st.session_state.setdefault("doc_chunk_size", DOC_CHUNK_SIZE)
     st.session_state.setdefault("calls_chunk_size", CALLS_CHUNK_SIZE)
     st.session_state.setdefault("model_context_window_cache", {})
     st.session_state.setdefault("models_loaded", False)
+    # Сохранённые результаты (переживают любой rerun)
+    st.session_state.setdefault("doc_report", None)
+    st.session_state.setdefault("calls_report", None)
+    st.session_state.setdefault("export_docx", None)
+    # Непрерванный (остановленный) хвост генерации чата
+    st.session_state.setdefault("chat_partial", "")
 
 
 _init_session_state()
@@ -268,6 +203,19 @@ def _set_cancel() -> None:
     st.session_state["cancel"] = True
 
 
+def _current_generation() -> GenerationParams:
+    return GenerationParams(
+        temperature=float(st.session_state.get("temperature", DEFAULT_TEMPERATURE)),
+        top_p=float(st.session_state.get("top_p", DEFAULT_TOP_P)),
+        max_tokens=int(st.session_state.get("max_tokens", 0) or 0) or None,
+    )
+
+
+@st.cache_data(show_spinner="Извлекаю текст из файла...")
+def _extract_text_cached(file_name: str, file_bytes: bytes) -> str:
+    return extract_text(file_name, file_bytes)
+
+
 def _extract_files_text(uploaded_files: list[Any]) -> list[dict]:
     extracted: list[dict] = []
     for f in uploaded_files:
@@ -276,13 +224,13 @@ def _extract_files_text(uploaded_files: list[Any]) -> list[dict]:
         file_bytes = f.getvalue() if hasattr(f, "getvalue") else f.read()
         file_name = getattr(f, "name", "file")
         try:
-            text = extract_text(file_name, file_bytes)
+            text = _extract_text_cached(file_name, file_bytes)
             if not text.strip():
-                st.warning(f'Файл «{file_name}» пуст или не удалось извлечь текст.')
+                st.warning(f"Файл «{file_name}» пуст или не удалось извлечь текст.")
                 continue
             extracted.append({"name": file_name, "text": text})
         except Exception as e:
-            st.warning(f'Ошибка извлечения «{file_name}»: {e}')
+            st.warning(f"Ошибка извлечения «{file_name}»: {e}")
     return extracted
 
 
@@ -344,265 +292,118 @@ def _render_chunk_guidance(*, selected_chunk_size: int) -> None:
     hard_risk = int(ctx * 0.70 * 3.5)  # высокий риск переполнения окна на шагах с накоплением summary
 
     st.caption(
-        f"Контекст модели: ~{ctx} токенов. Рекомендуемый размер чанка: {rec_min:,}–{rec_max:,} символов.".replace(",", " ")
+        f"Контекст модели: ~{ctx} токенов. "
+        f"Рекомендуемый размер чанка: {format_int(rec_min)}–{format_int(rec_max)} символов."
     )
 
     if selected_chunk_size > hard_risk:
-        st.warning(
-            f"Выбранный размер {selected_chunk_size:,} выглядит рискованным для текущей модели (высокий риск упереться в лимит контекста).".replace(
-                ",", " "
-            )
-        )
+        st.warning(f"Размер {format_int(selected_chunk_size)} рискован: высокий риск переполнения контекстного окна.")
     elif selected_chunk_size > rec_max:
-        st.info(
-            f"Размер {selected_chunk_size:,} выше рекомендуемого диапазона. Это может снизить стабильность на длинных документах.".replace(
-                ",", " "
-            )
-        )
+        st.info(f"Размер {format_int(selected_chunk_size)} выше рекомендуемого — возможна меньшая стабильность.")
     elif selected_chunk_size < rec_min:
-        st.info(
-            f"Размер {selected_chunk_size:,} ниже рекомендуемого диапазона. Анализ будет безопаснее, но может стать менее целостным.".replace(
-                ",", " "
-            )
-        )
-
-
-def _detect_thinking_block(text: str) -> tuple[str, str]:
-    """
-    Выделяет блок «рассуждений» модели из ответа.
-    Паттерны: <think>...</think>, **Рассуждение:**...
-    Возвращает (thinking_text, answer_text).
-    """
-    m = re.search(r"<think>(.*?)</think>", text, re.DOTALL | re.IGNORECASE)
-    if m:
-        thinking = m.group(1).strip()
-        answer = (text[: m.start()] + text[m.end() :]).strip()
-        return thinking, answer
-
-    m = re.match(
-        r"\s*\*{0,2}(?:Рассуждени[ея]|Thinking|Reasoning|Мысли)\*{0,2}\s*:?\s*(.*?)(?:\n\n---|\n\n\*{0,2}(?:Ответ|Answer|Результат)\*{0,2})",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if m:
-        thinking = m.group(1).strip()
-        answer = text[m.end() :].strip()
-        if answer:
-            return thinking, answer
-
-    return "", text
-
-
-def _convert_markdown_to_docx(markdown_text: str) -> io.BytesIO:
-    """
-    Конвертирует Markdown текст в Word документ (.docx).
-    Возвращает BytesIO объект с содержимым документа.
-    """
-    doc = Document()
-    
-    # Устанавливаем стиль по умолчанию
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'Calibri'
-    font.size = Pt(11)
-    
-    lines = markdown_text.split('\n')
-    i = 0
-    
-    while i < len(lines):
-        line = lines[i].rstrip()
-        
-        # Пустая строка
-        if not line:
-            i += 1
-            continue
-        
-        # Заголовок H1 (#)
-        if line.startswith('# '):
-            p = doc.add_heading(line[2:].strip(), level=1)
-            i += 1
-            continue
-        
-        # Заголовок H2 (##)
-        if line.startswith('## '):
-            p = doc.add_heading(line[3:].strip(), level=2)
-            i += 1
-            continue
-        
-        # Заголовок H3 (###)
-        if line.startswith('### '):
-            p = doc.add_heading(line[4:].strip(), level=3)
-            i += 1
-            continue
-        
-        # Заголовок H4 (####)
-        if line.startswith('#### '):
-            p = doc.add_heading(line[5:].strip(), level=4)
-            i += 1
-            continue
-        
-        # Список (-, *, +)
-        if line.lstrip().startswith(('- ', '* ', '+ ')):
-            text = line.lstrip()[2:].strip()
-            # Убираем markdown форматирование жирного и курсива
-            text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-            text = re.sub(r'\*(.+?)\*', r'\1', text)
-            text = re.sub(r'__(.+?)__', r'\1', text)
-            text = re.sub(r'_(.+?)_', r'\1', text)
-            doc.add_paragraph(text, style='List Bullet')
-            i += 1
-            continue
-        
-        # Нумерованный список (1., 2., etc.)
-        if re.match(r'^\s*\d+\.\s', line):
-            text = re.sub(r'^\s*\d+\.\s+', '', line).strip()
-            # Убираем markdown форматирование
-            text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-            text = re.sub(r'\*(.+?)\*', r'\1', text)
-            doc.add_paragraph(text, style='List Number')
-            i += 1
-            continue
-        
-        # Обычный параграф
-        text = line.strip()
-        # Убираем markdown форматирование жирного и курсива
-        text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-        text = re.sub(r'\*(.+?)\*', r'\1', text)
-        text = re.sub(r'__(.+?)__', r'\1', text)
-        text = re.sub(r'_(.+?)_', r'\1', text)
-        
-        if text:
-            doc.add_paragraph(text)
-        
-        i += 1
-    
-    # Сохраняем в BytesIO
-    docx_buffer = io.BytesIO()
-    doc.save(docx_buffer)
-    docx_buffer.seek(0)
-    
-    return docx_buffer
-
-
-def _build_transcriptions_docx(transcripts: list[dict[str, str]]) -> io.BytesIO:
-    """
-    Формирует Word-документ с блоками:
-    название файла -> транскрибация -> пустая строка.
-    """
-    doc = Document()
-
-    style = doc.styles["Normal"]
-    font = style.font
-    font.name = "Calibri"
-    font.size = Pt(11)
-
-    doc.add_heading("Транскрибация диалогов", level=1)
-
-    total = len(transcripts)
-    for idx, item in enumerate(transcripts, start=1):
-        filename = (item.get("filename") or "").strip() or "Без названия"
-        transcript = (item.get("transcript") or "").strip()
-
-        p_name = doc.add_paragraph()
-        p_name.add_run("название файла: ").bold = True
-        p_name.add_run(filename)
-
-        p_transcript = doc.add_paragraph()
-        p_transcript.add_run("транскрибация: ").bold = True
-        p_transcript.add_run(transcript or "Транскрибация не получена.")
-
-        # Отступ между файлами
-        doc.add_paragraph("")
-        # Явный разделитель между диалогами
-        if idx < total:
-            doc.add_paragraph("────────────────────────────────────────")
-            doc.add_paragraph("")
-
-    docx_buffer = io.BytesIO()
-    doc.save(docx_buffer)
-    docx_buffer.seek(0)
-    return docx_buffer
+        st.info(f"Размер {format_int(selected_chunk_size)} ниже рекомендуемого — анализ может быть менее целостным.")
 
 
 # ──────────────────────────────────────────────
 # LLM helpers
 # ──────────────────────────────────────────────
-def refresh_models() -> None:
-    provider = st.session_state["llm_provider"]
-    base_url = st.session_state["llm_base_url"]
-    timeout_sec = int(st.session_state.get("llm_timeout_sec", settings.LLM_TIMEOUT_SEC))
-    api_key = settings.VLLM_API_KEY if provider == "vllm" else None
-
-    llm = LLMClient(provider=provider, base_url=base_url, timeout_sec=timeout_sec, api_key=api_key)
-    models_info = llm.list_models()
-    st.session_state["model_list"] = models_info.models
-    st.session_state["ollama_api_type"] = models_info.api_type
-    st.session_state["models_loaded"] = True
-    st.session_state["model_context_window_cache"] = {}
-    if models_info.models:
-        if not st.session_state.get("llm_model") or st.session_state["llm_model"] not in models_info.models:
-            st.session_state["llm_model"] = models_info.models[0]
-
-
 def build_llm() -> LLMClient:
     provider = st.session_state["llm_provider"]
-    api_key = settings.VLLM_API_KEY if provider == "vllm" else None
+    api_key: str | None = None
+    if provider == "vllm":
+        api_key = settings.VLLM_API_KEY
+    elif provider == "custom":
+        api_key = st.session_state.get("custom_api_key") or settings.DEFAULT_CUSTOM_API_KEY
     return LLMClient(
         provider=provider,
         base_url=st.session_state["llm_base_url"],
         timeout_sec=int(st.session_state.get("llm_timeout_sec", settings.LLM_TIMEOUT_SEC)),
         ollama_api_type=st.session_state.get("ollama_api_type"),
         api_key=api_key,
+        extra_headers=settings.extra_headers_for(provider),
     )
 
 
+def refresh_models() -> None:
+    provider = st.session_state["llm_provider"]
+    llm = build_llm()
+    try:
+        models_info = llm.list_models()
+        models, api_type = models_info.models, models_info.api_type
+    except Exception:
+        # У custom-API список моделей может быть недоступен — фолбэк на список из .env
+        if provider == "custom":
+            models, api_type = settings.custom_models, None
+        else:
+            raise
+
+    st.session_state["model_list"] = models
+    st.session_state["ollama_api_type"] = api_type
+    st.session_state["models_loaded"] = True
+    st.session_state["model_context_window_cache"] = {}
+    if models and (not st.session_state.get("llm_model") or st.session_state["llm_model"] not in models):
+        st.session_state["llm_model"] = models[0]
+
+
 # ──────────────────────────────────────────────
-# Sidebar — выбор модели и системный промпт
+# Sidebar — провайдер, модель, параметры генерации
 # ──────────────────────────────────────────────
 def render_sidebar() -> None:
     with st.sidebar:
-        st.markdown("## 🤖 Настройки модели")
+        # Переключатель темы: иконка луны/солнца, как в привычных сервисах
+        is_dark = _current_theme() == "dark"
+        head = st.columns([5, 1])
+        with head[0]:
+            st.markdown("## Настройки")
+        with head[1]:
+            st.markdown('<div class="theme-slot"></div>', unsafe_allow_html=True)
+            if st.button(
+                "",
+                icon="☀️" if is_dark else "🌙",
+                key="theme_toggle",
+                help="Светлая тема" if is_dark else "Тёмная тема",
+            ):
+                st.session_state["ui_theme"] = "light" if is_dark else "dark"
+                st.rerun()
 
-        # Выбор провайдера
-        provider_options = ["Ollama", "vLLM"]
+        labels = list(PROVIDER_LABELS.values())
         current_provider = st.session_state.get("llm_provider", "ollama")
-        provider_idx = 0 if current_provider == "ollama" else 1
-        
-        selected_provider = st.selectbox(
+        current_label = PROVIDER_LABELS.get(current_provider, labels[0])
+
+        selected_label = st.selectbox(
             "Провайдер",
-            provider_options,
-            index=provider_idx,
+            labels,
+            index=labels.index(current_label),
             key="sidebar_provider_select",
         )
-        
-        # Автоматически обновляем провайдер и URL при смене
-        new_provider = "ollama" if selected_provider == "Ollama" else "vllm"
-        if new_provider != st.session_state.get("llm_provider"):
+        new_provider = PROVIDER_BY_LABEL[selected_label]
+
+        if new_provider != current_provider:
             st.session_state["llm_provider"] = new_provider
-            # Автоматически обновляем base_url в зависимости от провайдера
-            if new_provider == "ollama":
-                st.session_state["llm_base_url"] = settings.DEFAULT_OLLAMA_URL
-            else:
-                st.session_state["llm_base_url"] = settings.DEFAULT_VLLM_URL
-            # Сбрасываем информацию о моделях
+            st.session_state["llm_base_url"] = _default_base_url(new_provider)
             st.session_state["models_loaded"] = False
             st.session_state["model_list"] = []
             st.session_state["llm_model"] = ""
+            st.session_state["ollama_api_type"] = None
             st.session_state["model_context_window_cache"] = {}
-            # Автоматически загружаем модели для нового провайдера
             try:
                 refresh_models()
-            except Exception:
-                pass
+            except Exception as e:
+                st.sidebar.warning(f"Модели не загрузились: {friendly_llm_error(e)}")
 
-        # Отображаем текущий URL
-        st.caption(f"🔗 URL: {st.session_state.get('llm_base_url', 'не установлен')}")
-
-        st.divider()
+        provider = st.session_state["llm_provider"]
 
         # Выбор модели
         model_list = st.session_state.get("model_list", []) or []
-        if model_list:
+        if provider == "custom" and not model_list:
+            default_model = settings.custom_models[0] if settings.custom_models else ""
+            st.session_state["llm_model"] = st.text_input(
+                "Название модели",
+                value=st.session_state.get("llm_model") or default_model,
+                placeholder="Например: gpt-4o-mini или Qwen/Qwen2.5-7B-Instruct",
+                help="Список не удалось получить с /v1/models — укажите модель вручную",
+            )
+        elif model_list:
             current = st.session_state.get("llm_model", "")
             idx = model_list.index(current) if current in model_list else 0
             st.session_state["llm_model"] = st.selectbox(
@@ -614,26 +415,79 @@ def render_sidebar() -> None:
         else:
             st.info("Модели не загружены. Нажмите «Обновить».")
 
-        if st.button("🔄 Обновить список моделей", key="sidebar_refresh"):
+        if st.button("Обновить список моделей", key="sidebar_refresh"):
             try:
+                st.session_state.pop("_probe_cache", None)
                 refresh_models()
                 st.rerun()
             except Exception as e:
-                st.error(f"Ошибка: {e}")
+                st.error(f"Не удалось обновить список моделей: {friendly_llm_error(e)}")
 
-        st.divider()
+        # Статус подключения к провайдеру (кэш 30 с)
+        if provider == "vllm":
+            probe_key = settings.VLLM_API_KEY or ""
+        elif provider == "custom":
+            probe_key = st.session_state.get("custom_api_key") or settings.DEFAULT_CUSTOM_API_KEY or ""
+        else:
+            probe_key = ""
+        ok, info, age = _probe_provider(provider, st.session_state["llm_base_url"], probe_key)
+        if age:
+            info = f"{info} · обновлено {age} с назад"
+        _render_connection_status(ok, info)
 
-        # Системный промпт
-        st.session_state["system_prompt"] = st.text_area(
-            "Системный промпт",
-            value=st.session_state.get("system_prompt", "") or "",
-            height=120,
-            key="sidebar_system_prompt",
-            placeholder="Введите системный промпт (необязательно)...",
-        )
+        # Редко редактируемое — по свёрнутым экспандерам (≤6 строк на экране)
+        if provider == "custom":
+            with st.expander("API-подключение", expanded=False):
+                st.session_state.setdefault("sidebar_custom_url", settings.DEFAULT_CUSTOM_URL)
+                base_url = st.text_input(
+                    "API Base URL",
+                    key="sidebar_custom_url",
+                    help="Базовый URL без /v1, например https://api.openai.com или http://my-server:8000",
+                )
+                st.session_state["llm_base_url"] = base_url.strip() or settings.DEFAULT_CUSTOM_URL
+                api_key = st.text_input(
+                    "API ключ",
+                    key="sidebar_custom_api_key_input",
+                    value=st.session_state.get("custom_api_key", ""),
+                    type="password",
+                )
+                st.session_state["custom_api_key"] = api_key.strip()
 
-        st.divider()
-        st.caption("Подключение настраивается через .env файл (для vLLM используйте VLLM_API_KEY).")
+        with st.expander("Параметры генерации", expanded=False):
+            st.session_state["temperature"] = st.slider(
+                "Temperature",
+                min_value=0.0,
+                max_value=2.0,
+                value=float(st.session_state.get("temperature", DEFAULT_TEMPERATURE)),
+                step=0.05,
+                help="Ниже — детерминированнее, выше — креативнее",
+            )
+            st.session_state["top_p"] = st.slider(
+                "Top-p (nucleus sampling)",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(st.session_state.get("top_p", DEFAULT_TOP_P)),
+                step=0.05,
+            )
+            st.session_state["max_tokens"] = st.number_input(
+                "Max tokens (0 — по умолчанию сервера)",
+                min_value=0,
+                max_value=131_072,
+                value=int(st.session_state.get("max_tokens", 0)),
+                step=256,
+            )
+
+        with st.expander("Системный промпт", expanded=False):
+            st.session_state["system_prompt"] = st.text_area(
+                "Системный промпт",
+                value=st.session_state.get("system_prompt", "") or "",
+                height=120,
+                key="sidebar_system_prompt",
+                placeholder="Введите системный промпт (необязательно)...",
+                label_visibility="collapsed",
+            )
+
+        st.caption("Подключение по умолчанию настраивается через .env (см. .env.example).")
 
 
 # ──────────────────────────────────────────────
@@ -641,130 +495,292 @@ def render_sidebar() -> None:
 # ──────────────────────────────────────────────
 def _auto_load_models() -> None:
     if not st.session_state.get("models_loaded"):
-        try:
+        with contextlib.suppress(Exception):
             refresh_models()
-        except Exception:
-            pass
+
+
+# ──────────────────────────────────────────────
+# Индикатор статуса подключения
+# ──────────────────────────────────────────────
+def _render_connection_status(ok: bool, text: str) -> None:
+    st.markdown(
+        f'<span class="st-dot {"ok" if ok else "bad"}"></span>'
+        f'<span class="st-dot-text">{html.escape(text)}</span>',
+        unsafe_allow_html=True,
+    )
+
+
+def _eta_hint(elapsed_sec: int, idx: int, total: int) -> str:
+    """Грубая экстраполяция: средняя длительность чанка × осталось чанков."""
+    if idx < 2 or idx >= total:
+        return ""
+    per_chunk = elapsed_sec / (idx - 1)
+    return f" · осталось ~{int(per_chunk * (total - idx))} с"
+
+
+# ──────────────────────────────────────────────
+# Рендер сохранённого отчёта (переживает rerun)
+# ──────────────────────────────────────────────
+def _render_report(*, report: dict, file_stem: str) -> None:
+    with st.container(border=True):
+        col_docx, col_md, col_cp, *_ = st.columns([1, 1, 1, 4])
+        with col_docx:
+            try:
+                docx_file = markdown_to_docx(report["markdown"])
+                st.download_button(
+                    label="Скачать .docx",
+                    data=docx_file,
+                    file_name=f"{file_stem}_{report['timestamp']}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"download_{file_stem}_docx",
+                )
+            except Exception as e:
+                st.warning(f"Не удалось создать Word файл: {e}")
+        with col_md:
+            st.download_button(
+                label="Скачать .md",
+                data=report["markdown"].encode("utf-8"),
+                file_name=f"{file_stem}_{report['timestamp']}.md",
+                mime="text/markdown",
+                key=f"download_{file_stem}_md",
+            )
+        with col_cp, st.popover("", icon="📋", key=f"copy_md_{file_stem}", help="Скопировать markdown"):
+            st.code(report["markdown"], language="markdown")
+        st.markdown(report["markdown"])
+        with st.expander("Детали: план и заметки по частям", expanded=False):
+            st.markdown("**План анализа:**")
+            st.code(report["plan"], language="text")
+            for idx, notes in report["notes"]:
+                st.markdown(f"**Часть {idx}**")
+                st.code(notes, language="text")
+
+
+def _save_report(key: str, result: Any) -> None:
+    st.session_state[key] = {
+        "markdown": result.final_markdown,
+        "plan": result.plan,
+        "notes": [(n.idx, n.notes) for n in result.per_chunk_notes],
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+    }
 
 
 # ──────────────────────────────────────────────
 # ТАБ 1: Чат (стиль ChatGPT)
 # ──────────────────────────────────────────────
-def run_chat() -> None:
-    # Компактные кнопки управления
-    btn_cols = st.columns([1, 1, 6])
-    with btn_cols[0]:
-        if st.button("🗑️ Очистить", key="chat_clear"):
-            st.session_state["chat_messages"] = []
-            st.session_state["chat_attached_docs"] = []
-            st.rerun()
-    with btn_cols[1]:
-        if st.button("⏹️ Стоп", key="chat_stop"):
-            _set_cancel()
-
-    # Отображение истории
-    for msg in st.session_state["chat_messages"]:
-        with st.chat_message(msg["role"]):
-            if msg["role"] == "assistant":
-                thinking, answer = _detect_thinking_block(msg["content"])
-                if thinking:
-                    with st.expander("💭 Рассуждения модели", expanded=False):
-                        st.markdown(thinking)
-                    st.markdown(answer)
-                else:
-                    st.markdown(msg["content"])
-            else:
-                display_text = msg.get("display", msg["content"])
-                st.markdown(display_text)
-
-    # Загрузка файлов для контекста
-    uploaded_docs = st.file_uploader(
-        "📎 Прикрепить документы",
-        type=["pdf", "docx", "xlsx", "txt", "doc"],
-        accept_multiple_files=True,
-        key="chat_docs_uploader",
-        label_visibility="collapsed",
+def _append_assistant(text: str, started_monotonic: float, *, stopped: bool = False) -> None:
+    st.session_state["chat_messages"].append(
+        {
+            "role": "assistant",
+            "content": text + ("\n\n_(генерация прервана)_" if stopped else ""),
+            "meta": {
+                "model": st.session_state.get("llm_model", ""),
+                "sec": round(time.monotonic() - started_monotonic, 1),
+                "tokens": max(1, round(len(text) / 3.5)),
+            },
+        }
     )
 
-    if uploaded_docs:
-        if not st.session_state["chat_attached_docs"]:
-            st.session_state["chat_attached_docs"] = _extract_files_text(list(uploaded_docs))
-            if st.session_state["chat_attached_docs"]:
-                names = ", ".join(d["name"] for d in st.session_state["chat_attached_docs"])
-                st.success(f"📄 Прикреплено: {names}")
 
-    # Поле ввода
-    message = st.chat_input("Напишите сообщение...")
-    if message:
-        if not st.session_state.get("llm_model") or st.session_state["llm_model"] == "(нет моделей)":
-            st.error("Сначала выберите модель в боковой панели (☰).")
-            return
+def _stream_assistant() -> bool:
+    """
+    Стримит ответ ассистента по текущей истории (последним должен быть user).
+    Возвращает True, если ответ добавлен полностью.
+    """
+    st.session_state["cancel"] = False
+    st.session_state["chat_partial"] = ""
 
-        docs_block = st.session_state["chat_attached_docs"]
-        full_prompt = _build_chat_user_prompt(message, docs_block)
+    llm = build_llm()
+    api_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state["chat_messages"]
+        if m["role"] in ("user", "assistant")
+    ]
+    started = time.monotonic()
+    assistant_text = ""
 
-        st.session_state["chat_messages"].append({
-            "role": "user",
-            "content": full_prompt,
-            "display": message + (f"\n\n📎 _{len(docs_block)} документ(ов) прикреплено_" if docs_block else ""),
-        })
-        st.session_state["chat_attached_docs"] = []
+    try:
+        stream_gen = llm.chat_completion(
+            model=st.session_state["llm_model"],
+            system_prompt=st.session_state.get("system_prompt", "") or None,
+            user_prompt="",  # не используется, когда передан messages
+            generation=_current_generation(),
+            stream=True,
+            cancel_check=_cancel_check,
+            messages=api_messages,
+        )
 
-        with st.chat_message("user"):
-            st.markdown(message)
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            for token in stream_gen:  # type: ignore[union-attr]
+                assistant_text += token
+                # держим в session_state, чтобы текст не потерялся при прерывании скрипта
+                st.session_state["chat_partial"] = assistant_text
+                placeholder.markdown(assistant_text + "▌")
+                if _cancel_check():
+                    break
+            placeholder.markdown(assistant_text)
 
-        # Стриминг ответа
-        st.session_state["cancel"] = False
-        llm = build_llm()
+        st.session_state["chat_partial"] = ""
+        _append_assistant(assistant_text, started)
+        return True
 
-        assistant_text = ""
-        try:
-            system_prompt_eff = st.session_state.get("system_prompt", "") or None
-            temperature_eff = float(st.session_state.get("temperature", DEFAULT_TEMPERATURE))
+    except CancelledError:
+        st.session_state["chat_partial"] = ""
+        if assistant_text:
+            _append_assistant(assistant_text, started, stopped=True)
+        st.info("Генерация остановлена")
+    except Exception as e:
+        st.session_state["chat_partial"] = ""
+        st.error(f"Ошибка генерации: {friendly_llm_error(e)}")
+    return False
 
-            # Собираем полную историю как массив messages для API
-            api_messages = []
-            for m in st.session_state["chat_messages"]:
-                if m["role"] in ("user", "assistant"):
-                    api_messages.append({"role": m["role"], "content": m["content"]})
 
-            cancel_check = _cancel_check
-            stream_gen = llm.chat_completion(
-                model=st.session_state["llm_model"],
-                system_prompt=system_prompt_eff,
-                user_prompt="",  # не используется когда передан messages
-                temperature=temperature_eff,
-                stream=True,
-                cancel_check=cancel_check,
-                messages=api_messages,
+def _chat_export_pdf() -> bytes:
+    return chat_to_pdf(st.session_state["chat_messages"])
+
+
+_CHAT_FILE_TYPES = ["pdf", "docx", "xlsx", "txt"]
+
+
+def _append_user_message(text: str, files: list[Any] | None = None) -> None:
+    docs = _extract_files_text(files) if files else []
+    full_prompt = _build_chat_user_prompt(text, docs)
+    display = text + (f"\n\nФайлы: {', '.join(d['name'] for d in docs)}" if docs else "")
+    st.session_state["chat_messages"].append({"role": "user", "content": full_prompt, "display": display})
+    st.session_state["chat_need_response"] = True
+
+
+def _mark_regen() -> None:
+    msgs = st.session_state["chat_messages"]
+    if msgs and msgs[-1]["role"] == "assistant":
+        msgs.pop()
+    if msgs:
+        st.session_state["chat_need_response"] = True
+
+
+def _chat_input_widget() -> tuple[bool, str, list[Any]]:
+    """Поле ввода: текст + файлы одним действием (вложения — streamlit >= 1.44)."""
+    if _CHAT_FILES_SUPPORTED:
+        raw = st.chat_input(
+            "Напишите сообщение или приложите документ…",
+            accept_file="multiple",
+            file_type=_CHAT_FILE_TYPES,
+        )
+        if raw is None:
+            return False, "", []
+        return True, (raw.text or "").strip(), list(raw.files or [])
+    text_only = st.chat_input("Напишите сообщение…")
+    return bool(text_only), (text_only or "").strip(), []
+
+
+@st.fragment
+def run_chat() -> None:
+    # Верхняя панель: только иконки, справа
+    _has_chat = bool(st.session_state["chat_messages"])
+    bar = st.columns([10, 1, 1])
+    with bar[1]:
+        if _has_chat:
+            st.download_button(
+                label="",
+                icon="📄",
+                data=_chat_export_pdf(),
+                file_name=f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                mime="application/pdf",
+                key="chat_export",
+                help="Скачать историю чата в PDF",
             )
-
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                for token in stream_gen:  # type: ignore[union-attr]
-                    assistant_text += token
-                    placeholder.markdown(assistant_text + "▌")
-                    if cancel_check():
-                        break
-                placeholder.markdown(assistant_text)
-
-            st.session_state["chat_messages"].append({"role": "assistant", "content": assistant_text})
+    with bar[2], st.popover("", icon="🗑", key="chat_clear_pop", help="Очистить историю"):
+        st.markdown("Очистить всю историю чата?")
+        yes, no = st.columns(2)
+        if yes.button("Очистить", key="chat_clear_yes", type="primary"):
+            st.session_state["chat_messages"] = []
+            st.session_state["chat_partial"] = ""
             st.rerun()
+        no.button("Отмена", key="chat_clear_no")
 
-        except CancelledError:
-            if assistant_text:
-                st.session_state["chat_messages"].append({"role": "assistant", "content": assistant_text})
-            st.info("⏹️ Генерация остановлена.")
-        except Exception as e:
-            st.error(f"Ошибка генерации: {e}")
+    # Если прошлый прогон был прерван (например, «Стоп») — сохраняем хвост ответа
+    partial = st.session_state.get("chat_partial", "")
+    if partial:
+        st.session_state["chat_partial"] = ""
+        _append_assistant(partial, time.monotonic(), stopped=True)
+
+    messages = st.session_state["chat_messages"]
+    need_response = bool(st.session_state.pop("chat_need_response", False))
+
+    # Блок истории сверху: сообщения по порядку + ответ, если он запрошен.
+    # Внутри streamlit сам прокручивает к последнему сообщению (scroll-to-bottom).
+    if messages or need_response:
+        with st.container(**({"height": _CHAT_HISTORY_PX} if _CONTAINER_HEIGHT_SUPPORTED else {})):
+            last_idx = len(messages) - 1
+            for idx, msg in enumerate(messages):
+                with st.chat_message(msg["role"]):
+                    if msg["role"] == "assistant":
+                        thinking, answer = detect_thinking_block(msg["content"])
+                        if thinking:
+                            with st.expander("Рассуждения модели", expanded=False):
+                                st.markdown(thinking)
+                            st.markdown(answer)
+                        else:
+                            st.markdown(msg["content"])
+                        meta = msg.get("meta")
+                        if meta:
+                            st.markdown(
+                                f'<div class="msg-meta">{meta["sec"]} с · ~{meta["tokens"]} ток.</div>',
+                                unsafe_allow_html=True,
+                            )
+                        if idx == last_idx and not need_response:
+                            st.button(
+                                "",
+                                icon="🔄",
+                                key="chat_regen",
+                                help="Удалить последний ответ и ответить заново",
+                                disabled=not st.session_state.get("llm_model"),
+                                on_click=_mark_regen,
+                            )
+                    else:
+                        st.markdown(msg.get("display", msg["content"]))
+
+            if need_response and not (messages and messages[-1]["role"] == "user"):
+                need_response = False
+            if need_response:
+                if not st.session_state.get("llm_model"):
+                    st.error("Сначала выберите модель в боковой панели.")
+                else:
+                    # кнопка должна отрендериться ДО стрима — CSS приподнимет её
+                    # в правый нижний угол, рядом с полем ввода
+                    st.button(
+                        "",
+                        icon="⏹",
+                        key="chat_stop",
+                        help="Остановить генерацию",
+                        on_click=_set_cancel,
+                    )
+                    if _stream_assistant():
+                        st.rerun()
+
+    # Поле ввода — сразу под историей
+    has_input, message, files = _chat_input_widget()
+    if has_input:
+        _append_user_message(message or "Проанализируй прикреплённые документы.", files)
+        st.rerun()
 
 
 # ──────────────────────────────────────────────
 # ТАБ 2: Анализ документов
 # ──────────────────────────────────────────────
+@st.fragment
 def run_doc_analysis() -> None:
-    st.markdown("#### 📄 Анализ документов")
+    st.markdown("#### Анализ документов")
     st.caption("Загрузите документы и опишите задачу. Система разобьёт текст на части и составит отчёт.")
+
+    st.selectbox(
+        "Шаблон задачи",
+        list(DOC_PRESETS),
+        key="doc_preset",
+        on_change=_apply_task_preset,
+        args=(DOC_PRESETS, "doc_preset", "doc_user_goal"),
+        help="Подставляет типовую формулировку в поле задачи — можно править",
+    )
 
     user_goal = st.text_area(
         "Что нужно проанализировать?",
@@ -773,34 +789,52 @@ def run_doc_analysis() -> None:
         placeholder="Например: найти все упоминания сроков, выделить ключевые риски...",
     )
 
+    analysis_mode = st.selectbox(
+        "Режим анализа",
+        options=["general", "spike"],
+        format_func=lambda m: {
+            "general": "Общий анализ документа",
+            "spike": "Всплеск обращений (транскрипты диалогов)",
+        }[m],
+        key="doc_analysis_mode",
+    )
+
     uploaded_docs = st.file_uploader(
-        "📎 Загрузить документы",
-        type=["pdf", "docx", "xlsx", "txt", "doc"],
+        "Загрузить документы",
+        type=["pdf", "docx", "xlsx", "txt"],
         accept_multiple_files=True,
         key="doc_uploader",
     )
 
-    doc_chunk_size = st.number_input(
-        "Размер чанка",
-        min_value=1000,
-        max_value=100000,
-        step=500,
-        key="doc_chunk_size",
-        help="Символов в одном чанке для анализа документов.",
-    )
-    _render_chunk_guidance(selected_chunk_size=int(doc_chunk_size))
+    with st.expander("Параметры дробления", expanded=False):
+        doc_chunk_size = st.number_input(
+            "Размер чанка",
+            min_value=1000,
+            max_value=100000,
+            step=500,
+            key="doc_chunk_size",
+            help="Символов в одном чанке для анализа документов.",
+        )
+        _render_chunk_guidance(selected_chunk_size=int(doc_chunk_size))
+        total_len = sum(len(d["text"] or "") for d in st.session_state.get("doc_attached_files", []))
+        if total_len:
+            st.caption(f"≈ {-(-total_len // max(1, int(doc_chunk_size)))} чанков при выбранном размере")
 
     if uploaded_docs:
         st.session_state["doc_attached_files"] = _extract_files_text(list(uploaded_docs))
         if st.session_state["doc_attached_files"]:
             names = ", ".join(d["name"] for d in st.session_state["doc_attached_files"])
-            st.caption(f"📄 Загружено: {names}")
+            st.caption(f"Загружено: {names}")
+            with st.expander("Предпросмотр текста", expanded=False):
+                for d in st.session_state["doc_attached_files"]:
+                    st.markdown(f"**{d['name']}**")
+                    st.code((d["text"] or "")[:800] or "— пусто —", language="text")
 
-    col1, col2, col3 = st.columns([1, 1, 4])
+    col1, col2, _ = st.columns([1, 1, 4])
     with col1:
-        start_clicked = st.button("🚀 Начать", type="primary", key="doc_start")
+        start_clicked = st.button("Начать", type="primary", key="doc_start")
     with col2:
-        if st.button("⏹️ Стоп", key="doc_stop"):
+        if st.button("Стоп", key="doc_stop"):
             _set_cancel()
 
     if start_clicked:
@@ -811,15 +845,20 @@ def run_doc_analysis() -> None:
         elif not st.session_state.get("llm_model"):
             st.error("Выберите модель в боковой панели.")
         else:
-            _start_doc_pipeline(user_goal=user_goal)
+            _start_doc_pipeline(user_goal=user_goal, analysis_mode=analysis_mode)
+
+    report = st.session_state.get("doc_report")
+    if report:
+        st.markdown("### Результат анализа")
+        _render_report(report=report, file_stem="Анализ_документов")
 
 
-def _start_doc_pipeline(*, user_goal: str) -> None:
+def _start_doc_pipeline(*, user_goal: str, analysis_mode: str) -> None:
     cancel_check = _cancel_check
     _reset_cancel()
 
     docs = st.session_state["doc_attached_files"]
-    full_text = "\n\n".join(f"--- Документ: {d['name']} ---\n{d['text']}" for d in docs).strip()
+    full_text = _build_docs_block(docs).strip()
     if not full_text:
         st.warning("Не удалось собрать текст из документов.")
         return
@@ -834,14 +873,17 @@ def _start_doc_pipeline(*, user_goal: str) -> None:
     )
 
     system_prompt = st.session_state.get("system_prompt", "") or None
-    temperature = float(st.session_state.get("temperature", DEFAULT_TEMPERATURE))
+    generation = _current_generation()
 
-    progress = st.progress(0, text="📋 Составляю план анализа...")
+    progress = st.progress(0, text="Составляю план анализа…")
     status = st.empty()
+    t0 = time.monotonic()
 
     def on_chunk_start(idx: int, total: int) -> None:
         pct = int(idx / total * 100)
-        progress.progress(min(99, pct), text=f"📊 Часть {idx}/{total}")
+        elapsed = int(time.monotonic() - t0)
+        eta = _eta_hint(elapsed, idx, total)
+        progress.progress(min(99, pct), text=f"Часть {idx}/{total} · {elapsed} с{eta}")
         status.write(f"Анализирую часть {idx}/{total}...")
 
     try:
@@ -849,64 +891,45 @@ def _start_doc_pipeline(*, user_goal: str) -> None:
             llm=llm,
             model=st.session_state["llm_model"],
             system_prompt=system_prompt,
-            analysis_mode="general",
+            analysis_mode=analysis_mode,
             user_goal=user_goal,
             full_text=full_text,
             chunking_settings=chunking_settings,
-            temperature=temperature,
+            generation=generation,
             cancel_check=cancel_check,
             on_chunk_start=on_chunk_start,
         )
 
-        progress.progress(100, text="✅ Готово!")
+        progress.progress(100, text="Готово")
         status.empty()
 
-        # Сохраняем результат в session_state
-        st.session_state["doc_analysis_result"] = result.final_markdown
-
-        st.success("Анализ завершён!")
-
-        # Кнопка скачивания
-        try:
-            docx_file = _convert_markdown_to_docx(result.final_markdown)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"Анализ_документов_{timestamp}.docx"
-            
-            st.download_button(
-                label="📥 Скачать отчёт (Word)",
-                data=docx_file,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="download_doc_report"
-            )
-        except Exception as e:
-            st.warning(f"Не удалось создать Word файл: {e}")
-
-        # Отчёт н всю ширину в контейнере
-        st.divider()
-        with st.container():
-            st.markdown(result.final_markdown)
-        st.divider()
-
-        with st.expander("🔍 Детали: план и заметки по частям", expanded=False):
-            st.markdown("**План анализа:**")
-            st.code(result.plan, language="text")
-            for n in result.per_chunk_notes:
-                st.markdown(f"**Часть {n.idx}**")
-                st.code(n.notes, language="text")
+        _save_report("doc_report", result)
+        st.rerun()
 
     except AnalysisCancelled:
-        st.info("⏹️ Анализ остановлен.")
+        status.empty()
+        st.info("Анализ остановлен")
     except Exception as e:
-        st.error(f"Ошибка анализа: {e}")
+        status.empty()
+        st.error(f"Ошибка анализа: {friendly_llm_error(e)}")
 
 
 # ──────────────────────────────────────────────
 # ТАБ 3: Анализ звонков
 # ──────────────────────────────────────────────
+@st.fragment
 def run_calls_analysis() -> None:
-    st.markdown("#### 📞 Анализ звонков")
+    st.markdown("#### Анализ звонков")
     st.caption("Загрузите WAV-файлы. Система транскрибирует их и проведёт анализ.")
+
+    st.selectbox(
+        "Шаблон задачи",
+        list(CALLS_PRESETS),
+        key="calls_preset",
+        on_change=_apply_task_preset,
+        args=(CALLS_PRESETS, "calls_preset", "calls_user_goal"),
+        help="Подставляет типовую формулировку в поле задачи — можно править",
+    )
 
     user_goal = st.text_area(
         "Что нужно найти в звонках?",
@@ -916,25 +939,26 @@ def run_calls_analysis() -> None:
     )
 
     uploaded_wavs = st.file_uploader(
-        "🎙️ Загрузить записи (WAV)",
+        "Загрузить записи (WAV)",
         type=["wav"],
         accept_multiple_files=True,
         key="calls_uploader",
     )
 
-    calls_chunk_size = st.number_input(
-        "Размер чанка",
-        min_value=1000,
-        max_value=100000,
-        step=500,
-        key="calls_chunk_size",
-        help="Символов в одном чанке для анализа звонков.",
-    )
-    _render_chunk_guidance(selected_chunk_size=int(calls_chunk_size))
+    with st.expander("Параметры дробления", expanded=False):
+        calls_chunk_size = st.number_input(
+            "Размер чанка",
+            min_value=1000,
+            max_value=100000,
+            step=500,
+            key="calls_chunk_size",
+            help="Символов в одном чанке для анализа звонков.",
+        )
+        _render_chunk_guidance(selected_chunk_size=int(calls_chunk_size))
 
-    col1, col2, col3 = st.columns([1, 1, 4])
+    col1, col2, _ = st.columns([1, 1, 4])
     with col1:
-        if st.button("🚀 Начать", type="primary", key="calls_start"):
+        if st.button("Начать", type="primary", key="calls_start"):
             if not uploaded_wavs:
                 st.warning("Загрузите WAV-файлы.")
             elif not user_goal.strip():
@@ -944,11 +968,16 @@ def run_calls_analysis() -> None:
             else:
                 _start_calls_pipeline(
                     user_goal=user_goal,
-                    uploaded_wavs=uploaded_wavs,
+                    uploaded_wavs=list(uploaded_wavs),
                 )
     with col2:
-        if st.button("⏹️ Стоп", key="calls_stop"):
+        if st.button("Стоп", key="calls_stop"):
             _set_cancel()
+
+    report = st.session_state.get("calls_report")
+    if report:
+        st.markdown("### Результат анализа")
+        _render_report(report=report, file_stem="Анализ_звонков")
 
 
 def _start_calls_pipeline(
@@ -963,7 +992,7 @@ def _start_calls_pipeline(
     endpoint = settings.TRANSCRIBE_URL
     file_field = settings.TRANSCRIBE_FILE_FIELD
 
-    progress = st.progress(0, text="🎙️ Транскрибация...")
+    progress = st.progress(0, text="Транскрибация…")
     status = st.empty()
 
     transcribe_client = TranscribeClient(endpoint=endpoint, timeout_sec=int(settings.LLM_TIMEOUT_SEC))
@@ -973,25 +1002,32 @@ def _start_calls_pipeline(
         total_files = len(uploaded_wavs)
         for i, f in enumerate(uploaded_wavs, start=1):
             if cancel_check():
-                st.info("⏹️ Остановлено.")
+                st.info("Остановлено")
                 return
 
             filename = getattr(f, "name", f"audio_{i}.wav")
             file_bytes = f.getvalue() if hasattr(f, "getvalue") else f.read()
 
-            status.write(f"🎙️ Транскрибация {i}/{total_files}: {filename}")
+            status.write(f"Транскрибация {i}/{total_files}: {filename}")
             pct = int(i / total_files * 30)
-            progress.progress(pct, text=f"🎙️ Транскрибация {i}/{total_files}...")
+            progress.progress(pct, text=f"Транскрибация {i}/{total_files}…")
 
-            resp = transcribe_client.transcribe_wav(
-                file_bytes=file_bytes,
-                filename=filename,
-                file_field=file_field,
-                cancel_check=cancel_check,
-            )
+            try:
+                resp = transcribe_client.transcribe_wav(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    file_field=file_field,
+                    cancel_check=cancel_check,
+                )
+            except CancelledError:
+                raise
+            except Exception as e:
+                progress.empty()
+                st.error(f"Ошибка транскрибации «{filename}»: {friendly_llm_error(e)}")
+                return
             transcripts.append({"dialogue_id": resp.dialogue_id, "transcript": resp.transcript})
-    except TranscribeCancelledError:
-        st.info("⏹️ Остановлено во время транскрибации.")
+    except CancelledError:
+        st.info("Остановлено во время транскрибации")
         return
 
     combined_text = "\n\n".join(
@@ -1004,7 +1040,7 @@ def _start_calls_pipeline(
         return
 
     system_prompt = st.session_state.get("system_prompt", "") or None
-    temperature = float(st.session_state.get("temperature", DEFAULT_TEMPERATURE))
+    generation = _current_generation()
     calls_chunk_size = int(st.session_state.get("calls_chunk_size", CALLS_CHUNK_SIZE))
 
     chunking_settings = ChunkingSettings(
@@ -1014,12 +1050,16 @@ def _start_calls_pipeline(
         custom_separator=CALLS_CUSTOM_SEPARATOR,
     )
 
-    status.write("📋 Составляю план анализа...")
-    progress.progress(35, text="📋 Планирование...")
+    status.write("Составляю план анализа…")
+    progress.progress(35, text="Планирование…")
+    t0 = time.monotonic()
 
     def on_chunk_start(idx: int, total: int) -> None:
         pct = 35 + int(idx / total * 60)
-        progress.progress(min(99, pct), text=f"📊 Часть {idx}/{total}")
+        elapsed = int(time.monotonic() - t0)
+        eta = _eta_hint(elapsed, idx, total)
+        progress.eta = _eta_hint(elapsed, idx, total)
+        progress(min(99, pct), text=f"Часть {idx}/{total} · {elapsed} с{eta}")
         status.write(f"Анализирую часть {idx}/{total}...")
 
     final_placeholder = st.empty()
@@ -1036,77 +1076,75 @@ def _start_calls_pipeline(
             user_goal=user_goal,
             full_text=combined_text,
             chunking_settings=chunking_settings,
-            temperature=temperature,
+            generation=generation,
             cancel_check=cancel_check,
             on_chunk_start=on_chunk_start,
             final_stream_callback=on_final_stream,
         )
 
-        progress.progress(100, text="✅ Готово!")
+        progress.progress(100, text="Готово")
         status.empty()
         final_placeholder.empty()
 
-        st.success("Анализ завершён!")
-
-        # Кнопка скачивания
-        try:
-            docx_file = _convert_markdown_to_docx(result.final_markdown)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"Анализ_звонков_{timestamp}.docx"
-
-            st.download_button(
-                label="📥 Скачать отчёт (Word)",
-                data=docx_file,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="download_calls_report",
-            )
-        except Exception as e:
-            st.warning(f"Не удалось создать Word файл: {e}")
-
-        # Отчёт на всю ширину
-        st.divider()
-        with st.container():
-            st.markdown(result.final_markdown)
-        st.divider()
-
-        with st.expander("🔍 Детали: план и заметки по частям", expanded=False):
-            st.markdown("**План анализа:**")
-            st.code(result.plan, language="text")
-            for n in result.per_chunk_notes:
-                st.markdown(f"**Часть {n.idx}**")
-                st.code(n.notes, language="text")
+        _save_report("calls_report", result)
+        st.rerun()
 
     except AnalysisCancelled:
-        st.info("⏹️ Анализ остановлен.")
+        status.empty()
+        st.info("Анализ остановлен")
     except CancelledError:
-        st.info("⏹️ Остановлено.")
+        status.empty()
+        st.info("Остановлено")
     except Exception as e:
-        st.error(f"Ошибка анализа звонков: {e}")
+        status.empty()
+        st.error(f"Ошибка анализа звонков: {friendly_llm_error(e)}")
 
 
 # ──────────────────────────────────────────────
 # ТАБ 4: Транскрибация в Word
 # ──────────────────────────────────────────────
+@st.fragment
 def run_transcription_export() -> None:
-    st.markdown("#### 📝 Транскрибация диалогов в Word")
+    st.markdown("#### Транскрибация диалогов в Word")
     st.caption(
         "Загрузите WAV-файлы. Сервис выполнит транскрибацию по порядку и соберёт единый Word-документ."
     )
 
     uploaded_wavs = st.file_uploader(
-        "🎙️ Загрузить записи (WAV)",
+        "Загрузить записи (WAV)",
         type=["wav"],
         accept_multiple_files=True,
         key="transcribe_export_uploader",
     )
 
-    col1, col2, col3 = st.columns([1, 1, 4])
+    col1, col2, _ = st.columns([1, 1, 4])
     with col1:
-        start_clicked = st.button("🚀 Начать", type="primary", key="transcribe_export_start")
+        start_clicked = st.button("Начать", type="primary", key="transcribe_export_start")
     with col2:
-        if st.button("⏹️ Стоп", key="transcribe_export_stop"):
+        if st.button("Стоп", key="transcribe_export_stop"):
             _set_cancel()
+
+    saved = st.session_state.get("export_docx")
+    if saved:
+        st.success(f"Готово: обработано файлов — {saved['count']}")
+        if saved["failed"]:
+            st.warning(
+                "Не удалось транскрибировать некоторые файлы: "
+                + ", ".join(saved["failed"])
+                + ". Они пропущены и не включены в Word-файл."
+            )
+        st.download_button(
+            label="Скачать .docx",
+            data=saved["data"],
+            file_name=f"Транскрибация_диалогов_{saved['timestamp']}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key="download_transcriptions_docx",
+        )
+        if saved.get("transcripts"):
+            with st.expander("Предпросмотр транскриптов", expanded=False):
+                for t in saved["transcripts"]:
+                    st.markdown(f"**{t['filename']}**")
+                    st.code(t["transcript"] or "— пусто —", language="text")
 
     if not start_clicked:
         return
@@ -1115,7 +1153,7 @@ def run_transcription_export() -> None:
         st.warning("Загрузите хотя бы один WAV-файл.")
         return
 
-    _start_transcription_export_pipeline(uploaded_wavs=uploaded_wavs)
+    _start_transcription_export_pipeline(uploaded_wavs=list(uploaded_wavs))
 
 
 def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
@@ -1126,7 +1164,7 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
     file_field = settings.TRANSCRIBE_FILE_FIELD
     transcribe_client = TranscribeClient(endpoint=endpoint, timeout_sec=int(settings.LLM_TIMEOUT_SEC))
 
-    progress = st.progress(0, text="🎙️ Транскрибация файлов...")
+    progress = st.progress(0, text="Транскрибация файлов…")
     status = st.empty()
 
     transcripts: list[dict[str, str]] = []
@@ -1136,14 +1174,14 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
     try:
         for i, f in enumerate(uploaded_wavs, start=1):
             if cancel_check():
-                st.info("⏹️ Обработка остановлена.")
+                st.info("Обработка остановлена")
                 return
 
             filename = getattr(f, "name", f"audio_{i}.wav")
             file_bytes = f.getvalue() if hasattr(f, "getvalue") else f.read()
 
-            status.write(f"🎙️ Транскрибация {i}/{total_files}: {filename}")
-            progress.progress(int(i / total_files * 100), text=f"🎙️ Транскрибация {i}/{total_files}...")
+            status.write(f"Транскрибация {i}/{total_files}: {filename}")
+            progress.progress(int(i / total_files * 100), text=f"Транскрибация {i}/{total_files}…")
 
             try:
                 resp = transcribe_client.transcribe_wav(
@@ -1152,13 +1190,15 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
                     file_field=file_field,
                     cancel_check=cancel_check,
                 )
+            except CancelledError:
+                raise
             except Exception:
                 failed_files.append(filename)
                 continue
 
             transcripts.append({"filename": filename, "transcript": (resp.transcript or "").strip()})
-    except TranscribeCancelledError:
-        st.info("⏹️ Обработка остановлена.")
+    except CancelledError:
+        st.info("Обработка остановлена")
         return
 
     if not transcripts:
@@ -1173,30 +1213,25 @@ def _start_transcription_export_pipeline(*, uploaded_wavs: list[Any]) -> None:
         return
 
     try:
-        docx_file = _build_transcriptions_docx(transcripts)
+        docx_file = transcriptions_to_docx(transcripts)
     except Exception as e:
         st.error(f"Транскрибация получена, но не удалось сформировать Word файл: {e}")
         return
 
     status.empty()
-    progress.progress(100, text="✅ Готово!")
-    st.success("Транскрибация завершена. Файл готов к скачиванию.")
-    if failed_files:
-        st.warning(
-            "Не удалось транскрибировать некоторые файлы: "
-            + ", ".join(failed_files)
-            + ". Они пропущены и не включены в Word-файл."
-        )
+    progress.empty()
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"Транскрибация_диалогов_{timestamp}.docx"
-    st.download_button(
-        label="📥 Скачать транскрибацию (Word)",
-        data=docx_file,
-        file_name=filename,
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        key="download_transcriptions_docx",
-    )
+    st.session_state["export_docx"] = {
+        "data": docx_file.getvalue(),
+        "failed": list(failed_files),
+        "count": len(transcripts),
+        "transcripts": [
+            {"filename": t.get("filename", ""), "transcript": (t.get("transcript") or "")[:500]}
+            for t in transcripts
+        ],
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+    }
+    st.rerun()
 
 
 # ──────────────────────────────────────────────
@@ -1209,7 +1244,7 @@ def main() -> None:
     render_sidebar()
 
     # Табы
-    tabs = st.tabs(["💬 Чат", "📄 Документы", "📞 Звонки", "📝 Транскрибация"])
+    tabs = st.tabs(["Чат", "Документы", "Звонки", "Транскрибация"])
     with tabs[0]:
         run_chat()
     with tabs[1]:

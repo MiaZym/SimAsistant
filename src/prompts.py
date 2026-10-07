@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 
 def build_plan_prompt(*, analysis_mode: str, user_goal: str, sample_text: str) -> str:
     """
@@ -54,7 +56,6 @@ def build_plan_prompt(*, analysis_mode: str, user_goal: str, sample_text: str) -
 
 def parse_plan_response(text: str) -> tuple[str, dict]:
     raw = (text or "").strip()
-    import re
 
     plan_match = re.search(r"===PLAN===([\s\S]*?)===END===", raw, flags=re.IGNORECASE)
     if not plan_match:
@@ -145,7 +146,6 @@ def build_chunk_prompt(
 
 def parse_chunk_response(text: str) -> dict:
     raw = (text or "").strip()
-    import re
 
     sum_re = re.compile(r"={2,}\s*(?:UPDATED_?)?SUMMARY\s*={2,}", flags=re.IGNORECASE)
     notes_re = re.compile(r"={2,}\s*(?:CHUNK_?)?NOTES\s*={2,}", flags=re.IGNORECASE)

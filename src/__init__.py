@@ -1,2 +1,2 @@
-# Package marker for streamlit_service.
+# Маркер пакета SimAssistant.
 

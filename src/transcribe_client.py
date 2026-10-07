@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional
 
 import requests
+
+from exceptions import CancelledError
+
+__all__ = ["TranscribeClient", "TranscriptionResult", "CancelledError"]
 
 
 @dataclass(frozen=True)
@@ -22,15 +26,15 @@ class TranscribeClient:
         *,
         file_bytes: bytes,
         filename: str,
-        file_field: str = "audio_file",
-        cancel_check: Optional[callable] = None,
+        file_field: str = "file",
+        cancel_check: Callable[[], bool] | None = None,
     ) -> TranscriptionResult:
         candidate_fields: list[str] = []
         for name in (file_field, "file", "audio_file", "audio", "upload_file"):
             if name and name not in candidate_fields:
                 candidate_fields.append(name)
 
-        resp: Optional[requests.Response] = None
+        resp: requests.Response | None = None
         for current_field in candidate_fields:
             files = {
                 current_field: (filename, file_bytes, "audio/wav"),
@@ -71,10 +75,6 @@ class TranscribeClient:
             raise CancelledError()
 
         return TranscriptionResult(dialogue_id=dialogue_id, transcript=transcript)
-
-
-class CancelledError(RuntimeError):
-    pass
 
 
 def _extract_error_detail(resp: requests.Response) -> str:
