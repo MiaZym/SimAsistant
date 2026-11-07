@@ -15,7 +15,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN mkdir -p /opt/venv && python -m venv /opt/venv
+# DejaVu нужен fpdf2 для экспорта кириллических сообщений чата в PDF.
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/venv \
+    && python -m venv /opt/venv
 
 # ── Зависимости ──
 FROM base AS deps

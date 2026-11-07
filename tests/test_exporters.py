@@ -2,7 +2,7 @@ import io
 
 from docx import Document
 
-from exporters import markdown_to_docx, transcriptions_to_docx
+from exporters import _unicode_fonts, chat_to_pdf, markdown_to_docx, transcriptions_to_docx
 
 
 def _doc(buffer: io.BytesIO) -> Document:
@@ -52,3 +52,17 @@ def test_transcriptions_to_docx_structure():
 
     # файл — это BytesIO с валидным docx (Document выше не упал)
     assert isinstance(transcriptions_to_docx(items), io.BytesIO)
+
+
+def test_chat_to_pdf_supports_cyrillic_when_unicode_font_is_available():
+    if _unicode_fonts() is None:
+        return
+
+    pdf = chat_to_pdf(
+        [
+            {"role": "user", "content": "Привет!"},
+            {"role": "assistant", "content": "Модель подключена."},
+        ]
+    )
+
+    assert pdf.startswith(b"%PDF")
